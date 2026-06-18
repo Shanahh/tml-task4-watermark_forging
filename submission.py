@@ -4,10 +4,15 @@ import requests
 from pathlib import Path
 
 
-BASE_URL = "http://34.63.153.158"
+BASE_URL = "http://34.63.153.158" #donot change
+
 API_KEY  = "YOUR_API_KEY_HERE"  # REPLACE WITH YOUR API KEY
-TASK_ID   = "22-forging-task"
-FILE_PATH = Path("/PATH/FILE.zip")
+
+TASK_ID   = "22-forging-task" #donot change
+
+FILE_PATH = Path("PATH/TO/YOUR/ZIP.zip") 
+
+SUBMIT = True # set to True to enable submission
 
 def die(msg):
     print(f"{msg}", file=sys.stderr)
