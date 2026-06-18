@@ -12,7 +12,7 @@ FILE_PATH = Path("/PATH/FILE.zip")
 def die(msg):
     print(f"{msg}", file=sys.stderr)
     sys.exit(1)
-
+OUTPUT_FILE = FILE_PATH
 
 if not os.path.isfile(FILE_PATH):
     die(f"File not found: {FILE_PATH}")
@@ -20,7 +20,7 @@ if not os.path.isfile(FILE_PATH):
 try:
     with open(FILE_PATH, "rb") as f:
         files = {
-            "file": (os.path.basename(FILE_PATH), f, "zip"),
+            "file": (OUTPUT_FILE.name, f, "zip"),
         }
         resp = requests.post(
             f"{BASE_URL}/submit/{TASK_ID}",
