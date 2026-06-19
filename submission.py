@@ -31,7 +31,7 @@ try:
             f"{BASE_URL}/submit/{TASK_ID}",
             headers={"X-API-Key": API_KEY},
             files=files,
-            timeout=(50, 300),
+            # timeout=(50, 300),
         )
     try:
         body = resp.json()
