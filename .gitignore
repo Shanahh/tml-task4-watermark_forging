@@ -1,0 +1,6 @@
+*.sub
+__pycache__/
+runlogs/
+*.zip
+clean_targets/
+watermarked_sources/

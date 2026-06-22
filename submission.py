@@ -6,11 +6,11 @@ from pathlib import Path
 
 BASE_URL = "http://34.63.153.158" #donot change
 
-API_KEY  = "YOUR_API_KEY_HERE"  # REPLACE WITH YOUR API KEY
+API_KEY  = "ef283bd434803248eee23a3b016499ae"  # REPLACE WITH YOUR API KEY
 
 TASK_ID   = "22-forging-task" #donot change
 
-FILE_PATH = Path("PATH/TO/YOUR/ZIP.zip") 
+FILE_PATH = Path("/home/atml_team052/tml-task4-watermark_forging/submission.zip") 
 
 SUBMIT = True # set to True to enable submission
 
@@ -59,3 +59,4 @@ except requests.exceptions.RequestException as e:
             print("Server response (text):", detail.text)
     sys.exit(1)
     
+
