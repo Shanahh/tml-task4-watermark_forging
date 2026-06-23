@@ -1,0 +1,9 @@
+# Install the correct CUDA-enabled torch/torchvision build separately.
+diffusers>=0.35,<0.40
+transformers>=4.44
+accelerate>=1.0
+peft>=0.13
+safetensors>=0.4
+Pillow>=10
+numpy>=1.26
+tqdm>=4.66
