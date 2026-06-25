@@ -55,3 +55,8 @@ def load_dataset(root:Path):
     return src,clean
 
 def write_json(p:Path,obj): p.parent.mkdir(parents=True,exist_ok=True); p.write_text(json.dumps(obj,indent=2))
+
+def category_for_id(i:int)->str:
+    for c,(lo,hi) in CATEGORY_RANGES.items():
+        if lo<=i<=hi: return c
+    raise ValueError(i)

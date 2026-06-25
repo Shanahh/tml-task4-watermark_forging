@@ -23,6 +23,13 @@ def phase_template(xs,thr):
  z=np.fft.fft2(np.stack(rs),axes=(1,2)); unit=z/(np.abs(z)+EPS); mu=unit.mean(0); coh=np.abs(mu); ph=np.angle(mu); mag=np.median(np.abs(z),0); mask=coh>=thr; mask[0,0]=False; t=np.fft.ifft2(mask*mag*np.exp(1j*ph)).real; return (t-t.mean())/(t.std()+EPS)
 def apply_luma(x,t,s):
  y=rgb_to_ycbcr(x); y[...,0]=np.clip(y[...,0]+s*t,0,1); return ycbcr_to_rgb(y)
+def lsb_template(xs,ch):
+ bits=[]
+ for x in xs:
+  c=np.round(rgb_to_ycbcr(x)[...,ch]*255).astype(np.uint8); bits.append(c&1)
+ return (np.mean(np.stack(bits),0)>=0.5).astype(np.uint8)
+def apply_lsb(x,template,ch):
+ y=rgb_to_ycbcr(x); c=np.round(y[...,ch]*255).astype(np.uint8); c=(c&0xFE)|template; y[...,ch]=c.astype(np.float32)/255.0; return ycbcr_to_rgb(y)
 COORDS=[(0,1),(1,0),(1,1),(0,2),(2,0),(1,2),(2,1),(2,2),(0,3),(3,0),(1,3),(3,1),(2,3),(3,2),(3,3)]
 def stats(xs):
  d={c:[] for c in COORDS}
@@ -50,13 +57,14 @@ def apply_dct(x,sel,ws,cs,s):
 def main():
  a=parse_args(); src,clean=load_dataset(a.dataset); byres={}
  for im in clean.values():byres.setdefault((im.shape[1],im.shape[0]),[]).append(im)
- t1=channel_template(src['WM_1'],1); t5b=channel_template(src['WM_5'],1); t5r=channel_template(src['WM_5'],2); t4=phase_template(src['WM_4'],a.wm4_threshold); ws=stats(src['WM_6']); res=(src['WM_6'][0].shape[1],src['WM_6'][0].shape[0]); cs=stats(byres[res]); sel=select(ws,cs,a.wm6_coeff_count); print('WM6 DCT coeffs',sel)
+ t1=channel_template(src['WM_1'],1); t4=phase_template(src['WM_4'],a.wm4_threshold); ws=stats(src['WM_6']); res=(src['WM_6'][0].shape[1],src['WM_6'][0].shape[0]); cs=stats(byres[res]); sel=select(ws,cs,a.wm6_coeff_count); print('WM6 DCT coeffs',sel)
+ t5b_lsb=lsb_template(src['WM_5'],1); t5r_lsb=lsb_template(src['WM_5'],2)
  for s in [float(v) for v in a.strength_grid.split(',')]:
   out=a.output_dir/f'strength_{s:g}'; out.mkdir(parents=True,exist_ok=True)
   for i,x in clean.items():
    if 1<=i<=25:y=apply_channel(x,t1,1,s)
    elif 76<=i<=100:y=apply_luma(x,t4,s)
-   elif 101<=i<=125:y=apply_channel(apply_channel(x,t5b,1,s),t5r,2,s)
+   elif 101<=i<=125:y=apply_lsb(apply_lsb(x,t5b_lsb,1),t5r_lsb,2)
    elif 126<=i<=150:y=apply_dct(x,sel,ws,cs,min(1,s*25))
    else:y=x
    save_rgb(y,out/f'{i}.png')
