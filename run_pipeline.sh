@@ -98,26 +98,56 @@ echo "=== [3/6] Specialized candidates (WM_1, WM_4, WM_5, WM_6) ==="
 # ---------------------------------------------------------------------------
 # 5. Surrogate-classifier ensembles for categories with no validated
 #    hand-crafted signal: WM_2, WM_3, WM_7, WM_8.
+#
+#    Two structurally different architectures (cnn_a, cnn_b) are trained per
+#    category. cnn_a is the one forge_pgd.py attacks by default; cnn_b is an
+#    independent holdout ensemble used only for the transfer sanity check in
+#    step 6 below, never as part of the actual attack.
 # ---------------------------------------------------------------------------
-echo "=== [4/6] Surrogate ensembles (WM_2, WM_3, WM_7, WM_8) ==="
+echo "=== [4/7] Surrogate ensembles (WM_2, WM_3, WM_7, WM_8) ==="
 for CAT in WM_2 WM_3 WM_7 WM_8; do
-    "$PYTHON" "$PROJECT/train_surrogate.py" \
-        --dataset "$DATASET" \
-        --category "$CAT" \
-        --output-dir "$PROJECT/surrogates" \
-        --ensemble-size 5 \
-        --epochs 40
+    for ARCH in cnn_a cnn_b; do
+        "$PYTHON" "$PROJECT/train_surrogate.py" \
+            --dataset "$DATASET" \
+            --category "$CAT" \
+            --arch "$ARCH" \
+            --output-dir "$PROJECT/surrogates" \
+            --ensemble-size 5 \
+            --epochs 40
+    done
 done
 
 # ---------------------------------------------------------------------------
-# 6. PGD candidates for the same surrogate-driven categories.
+# 6. Cross-surrogate transfer sanity check, before spending a real submission
+#    on these categories. If the holdout ensemble (cnn_b) doesn't agree with
+#    the attack ensemble (cnn_a) on the PGD-perturbed images, the attack is
+#    very likely overfitting to the attack ensemble rather than capturing a
+#    real watermark signal -- see check_surrogate_transfer.py docstring.
+#    Informational only: does not stop the pipeline.
 # ---------------------------------------------------------------------------
-echo "=== [5/6] PGD candidates (WM_2, WM_3, WM_7, WM_8) ==="
+echo "=== [5/7] Surrogate transfer sanity check (WM_2, WM_3, WM_7, WM_8) ==="
+for CAT in WM_2 WM_3 WM_7 WM_8; do
+    "$PYTHON" "$PROJECT/check_surrogate_transfer.py" \
+        --dataset "$DATASET" \
+        --category "$CAT" \
+        --attack-models "$PROJECT/surrogates" --attack-arch cnn_a \
+        --holdout-models "$PROJECT/surrogates" --holdout-arch cnn_b \
+        --eps 0.0078431373 \
+        --steps 50 \
+        --step-size 0.0009803922 \
+        --output "$PROJECT/transfer_check_${CAT,,}.json" || true
+done
+
+# ---------------------------------------------------------------------------
+# 7. PGD candidates for the same surrogate-driven categories (attacks cnn_a).
+# ---------------------------------------------------------------------------
+echo "=== [6/7] PGD candidates (WM_2, WM_3, WM_7, WM_8) ==="
 for CAT in WM_2 WM_3 WM_7 WM_8; do
     "$PYTHON" "$PROJECT/forge_pgd.py" \
         --dataset "$DATASET" \
         --category "$CAT" \
         --models "$PROJECT/surrogates" \
+        --arch cnn_a \
         --output-dir "$PROJECT/pgd_candidates" \
         --eps-grid 0.0039215686,0.0078431373,0.011764706 \
         --steps 50 \
@@ -125,15 +155,16 @@ for CAT in WM_2 WM_3 WM_7 WM_8; do
 done
 
 # ---------------------------------------------------------------------------
-# 7. Build the final submission.
+# 8. Build the final submission.
 #
 #    Routing below picks one candidate per category as a sane starting
 #    point (strength_0.005 for specialized, eps_0.007843 for PGD, i.e. 2/255).
-#    Re-run category ablations against baseline_candidates and edit
-#    routing.json before submitting for real — this default routing is not
-#    guaranteed to be the best-scoring combination.
+#    Re-run category ablations against baseline_candidates, check the
+#    transfer_check_*.json verdicts from step 6, and edit routing.json before
+#    submitting for real — this default routing is not guaranteed to be the
+#    best-scoring combination.
 # ---------------------------------------------------------------------------
-echo "=== [6/6] Build submission ==="
+echo "=== [7/7] Build submission ==="
 ROUTING="$PROJECT/routing.json"
 cat > "$ROUTING" <<JSON
 {
