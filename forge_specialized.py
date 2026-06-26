@@ -51,9 +51,68 @@ from pathlib import Path
 
 import numpy as np
 from scipy.fft import dctn, idctn
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, median_filter
 
 from common import EPS, grayscale, load_dataset, rgb_to_ycbcr, save_rgb, ycbcr_to_rgb
+
+
+# --------------------------------------------------------------------------
+# Content estimation for residual extraction.
+#
+# The channel-residual attacks recover the watermark as (channel - estimated
+# clean content). How the clean content is estimated determines how cleanly
+# the watermark is isolated:
+#
+#   "highpass" (default): clean ~ gaussian-blurred channel. Cheap, but it
+#       keeps sharp edges/texture (high-frequency *content*) in the residual,
+#       leaking content into the template, and discards any low-frequency
+#       watermark component.
+#   "denoiser": clean ~ a proper edge-preserving denoiser. For a noise-like
+#       (spread-spectrum) watermark this isolates delta far better, because the
+#       denoiser removes the noise-like watermark across all bands while
+#       preserving content (edges/texture) -- i.e. the residual is the
+#       watermark, not the content. This is the classic Watermark Copy Attack
+#       (Kutter et al.) estimator. Wavelet (BayesShrink) when PyWavelets is
+#       available, scipy median-filter fallback otherwise.
+#
+# This is opt-in via --extraction; the default preserves the prior behavior
+# exactly, so an existing calibrated run is unchanged.
+# --------------------------------------------------------------------------
+
+EXTRACTION_METHODS = ("highpass", "denoiser")
+
+
+def _wavelet_denoise(channel, wavelet="db4", level=3):
+    import pywt
+
+    coeffs = pywt.wavedec2(channel, wavelet, level=level, mode="periodization")
+    finest = coeffs[-1][-1]
+    sigma = np.median(np.abs(finest)) / 0.6745  # robust noise std (MAD)
+    out = [coeffs[0]]
+    for details in coeffs[1:]:
+        thresholded = []
+        for d in details:
+            var = np.var(d)
+            sigma_x = np.sqrt(max(var - sigma ** 2, 1e-12))
+            thresh = sigma ** 2 / sigma_x  # BayesShrink, per subband
+            thresholded.append(pywt.threshold(d, thresh, mode="soft"))
+        out.append(tuple(thresholded))
+    denoised = pywt.waverec2(out, wavelet, mode="periodization")
+    return denoised[: channel.shape[0], : channel.shape[1]]
+
+
+def estimate_content(channel, method):
+    if method == "highpass":
+        return gaussian_filter(channel, 1.5, mode="reflect")
+    if method == "denoiser":
+        try:
+            return _wavelet_denoise(channel)
+        except ImportError:
+            # scipy-only fallback: median filter is edge-preserving and needs
+            # no extra dependency. Less ideal than wavelet for spread-spectrum
+            # watermarks but still far better than a gaussian blur.
+            return median_filter(channel, size=3, mode="reflect")
+    raise ValueError(method)
 
 
 def parse_args():
@@ -81,18 +140,31 @@ def parse_args():
     p.add_argument("--wm6-strength", type=float, default=0.04)
     p.add_argument("--wm4-threshold", type=float, default=0.45)
     p.add_argument("--wm6-coeff-count", type=int, default=8)
+    p.add_argument(
+        "--extraction",
+        default="highpass",
+        choices=EXTRACTION_METHODS,
+        help="how the channel-residual attacks (WM_1/3/5) estimate clean content. "
+        "'highpass' is the default and preserves prior behavior; 'denoiser' is "
+        "opt-in and isolates spread-spectrum watermarks more cleanly. NOTE: the "
+        "calibrated default strengths were derived for 'highpass' -- re-run "
+        "calibrate_strength.py --extraction denoiser and pass the new strengths.",
+    )
     return p.parse_args()
 
 
 # --------------------------------------------------------------------------
-# WM_1, WM_5: channel high-pass residual templates
+# WM_1, WM_3, WM_5: channel residual templates (content estimated per
+# --extraction; see estimate_content above).
 # --------------------------------------------------------------------------
 
-def channel_template(xs, ch):
-    residuals = []
-    for x in xs:
-        c = rgb_to_ycbcr(x)[..., ch]
-        residuals.append(c - gaussian_filter(c, 1.5, mode="reflect"))
+def channel_residual(x, ch, method="highpass"):
+    c = rgb_to_ycbcr(x)[..., ch]
+    return c - estimate_content(c, method)
+
+
+def channel_template(xs, ch, method="highpass"):
+    residuals = [channel_residual(x, ch, method) for x in xs]
     template = np.median(np.stack(residuals), 0)
     return (template - template.mean()) / (template.std() + EPS)
 
@@ -311,11 +383,12 @@ def main():
     for im in clean.values():
         by_resolution.setdefault((im.shape[1], im.shape[0]), []).append(im)
 
-    wm1_cb_template = channel_template(src["WM_1"], 1)
-    wm3_channel_templates = {ch: channel_template(src["WM_3"], ch) for ch in WM3_CHANNELS}
+    method = args.extraction
+    wm1_cb_template = channel_template(src["WM_1"], 1, method)
+    wm3_channel_templates = {ch: channel_template(src["WM_3"], ch, method) for ch in WM3_CHANNELS}
     wm4_phase_template = phase_template(src["WM_4"], args.wm4_threshold)
-    wm5_cb_template = channel_template(src["WM_5"], 1)
-    wm5_cr_template = channel_template(src["WM_5"], 2)
+    wm5_cb_template = channel_template(src["WM_5"], 1, method)
+    wm5_cr_template = channel_template(src["WM_5"], 2, method)
     wm5_cb_lsb = lsb_template(src["WM_5"], 1)
     wm5_cr_lsb = lsb_template(src["WM_5"], 2)
 
@@ -326,7 +399,7 @@ def main():
     print("WM6 DCT coeffs", wm6_coords)
     wm3_strengths = {0: args.wm3_y_strength, 1: args.wm3_cb_strength, 2: args.wm3_cr_strength}
     print(
-        f"strengths: WM_1={args.wm1_strength} "
+        f"extraction={method} | strengths: WM_1={args.wm1_strength} "
         f"WM_3(Y/Cb/Cr)={args.wm3_y_strength}/{args.wm3_cb_strength}/{args.wm3_cr_strength} "
         f"WM_4={args.wm4_strength} WM_5={args.wm5_strength} WM_6={args.wm6_strength}"
     )

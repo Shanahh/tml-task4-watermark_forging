@@ -51,8 +51,15 @@ from pathlib import Path
 import numpy as np
 from scipy.ndimage import gaussian_filter
 
-from common import CATEGORY_RANGES, EPS, grayscale, load_dataset, rgb_to_ycbcr, write_json
-from forge_specialized import apply_channel, apply_luma, channel_template, phase_template
+from common import CATEGORY_RANGES, EPS, grayscale, load_dataset, write_json
+from forge_specialized import (
+    EXTRACTION_METHODS,
+    apply_channel,
+    apply_luma,
+    channel_residual,
+    channel_template,
+    phase_template,
+)
 
 CHANNEL_LABELS = {0: "Y", 1: "Cb", 2: "Cr"}
 # Reference strengths used to fit the (strength -> projection) line. Spanning
@@ -73,18 +80,23 @@ def parse_args():
     p.add_argument("--wm4-strength", type=float, default=0.0091)
     p.add_argument("--wm5-strength", type=float, default=0.0071)
     p.add_argument("--wm4-threshold", type=float, default=0.45)
+    p.add_argument(
+        "--extraction",
+        default="highpass",
+        choices=EXTRACTION_METHODS,
+        help="must match the --extraction passed to forge_specialized.py: the genuine "
+        "amplitude (and so s*) differs between extraction methods because they "
+        "produce different template directions.",
+    )
     return p.parse_args()
 
 
 # --------------------------------------------------------------------------
 # Residual operators -- must match how each template's sources are built in
-# forge_specialized.py, so the projection is in the right domain.
+# forge_specialized.py, so the projection is in the right domain. channel_
+# residual is imported from forge_specialized so the two stay identical; only
+# luma_residual (for WM_4's phase template) is local.
 # --------------------------------------------------------------------------
-
-def channel_residual(x, ch):
-    c = rgb_to_ycbcr(x)[..., ch]
-    return c - gaussian_filter(c, 1.5, mode="reflect")
-
 
 def luma_residual(x):
     g = grayscale(x)
@@ -99,17 +111,17 @@ def project(residual, t_hat):
 # Per (category, channel) attack specs: template + matching residual + apply
 # --------------------------------------------------------------------------
 
-def build_specs(src, current_strengths, wm4_threshold):
+def build_specs(src, current_strengths, wm4_threshold, method):
     specs = []
 
     for cat, channels in [("WM_1", [1]), ("WM_3", [0, 1, 2]), ("WM_5", [1, 2])]:
         for ch in channels:
-            template = channel_template(src[cat], ch)
+            template = channel_template(src[cat], ch, method)
             specs.append({
                 "category": cat,
                 "label": CHANNEL_LABELS[ch],
                 "template": template,
-                "residual": (lambda x, ch=ch: channel_residual(x, ch)),
+                "residual": (lambda x, ch=ch: channel_residual(x, ch, method)),
                 "apply": (lambda x, s, template=template, ch=ch: apply_channel(x, template, ch, s)),
                 "current_strength": current_strengths[(cat, ch)],
             })
@@ -187,9 +199,10 @@ def main():
     }
 
     src, clean = load_dataset(args.dataset)
-    specs = build_specs(src, current_strengths, args.wm4_threshold)
+    specs = build_specs(src, current_strengths, args.wm4_threshold, args.extraction)
 
     results = []
+    print(f"extraction = {args.extraction}")
     print(f"{'cat':5} {'chan':7} {'genuine mu+/-sd':>20} {'s*':>9} {'s_now':>8} {'z@now':>7}  verdict")
     print("-" * 100)
     for spec in specs:
@@ -207,22 +220,22 @@ def main():
     write_json(args.output, results)
     print(f"\nwrote {args.output}")
 
-    # Per-category suggested strength: for multi-channel categories the apply
-    # uses one strength for all channels, so suggest the median of the
-    # channels' calibrated values and flag when they diverge a lot.
-    print("\nSuggested per-category strength (forge_specialized.py uses one strength per category):")
-    by_cat = {}
-    for r in results:
-        by_cat.setdefault(r["category"], []).append(r)
-    for cat, rows in by_cat.items():
-        s_stars = [r["calibrated_strength"] for r in rows]
-        suggested = float(np.median(s_stars))
-        spread = ""
-        if len(s_stars) > 1 and max(s_stars) > 2 * max(min(s_stars), EPS):
-            per_ch = ", ".join(f"{r['channel']}={r['calibrated_strength']:.4f}" for r in rows)
-            spread = (f"  [channels disagree >2x: {per_ch} -- per-channel strength "
-                      f"would help; one-strength compromise shown]")
-        print(f"  {cat}: --wm{cat[-1]}-strength {suggested:.4f}{spread}")
+    # Emit a copy-pasteable forge_specialized.py flag string with the
+    # calibrated s* values. WM_3 takes per-channel flags; the other channel
+    # categories take one flag (WM_5's Cb/Cr are averaged since the attack
+    # uses one strength for both).
+    by_cat_ch = {(r["category"], r["channel"]): r["calibrated_strength"] for r in results}
+    flags = [f"--wm1-strength {by_cat_ch[('WM_1', 'Cb')]:.4f}"]
+    flags.append(f"--wm3-y-strength {by_cat_ch[('WM_3', 'Y')]:.4f}")
+    flags.append(f"--wm3-cb-strength {by_cat_ch[('WM_3', 'Cb')]:.4f}")
+    flags.append(f"--wm3-cr-strength {by_cat_ch[('WM_3', 'Cr')]:.4f}")
+    flags.append(f"--wm4-strength {by_cat_ch[('WM_4', 'Y-phase')]:.4f}")
+    wm5 = 0.5 * (by_cat_ch[("WM_5", "Cb")] + by_cat_ch[("WM_5", "Cr")])
+    flags.append(f"--wm5-strength {wm5:.4f}")
+
+    print("\nCalibrated strengths for forge_specialized.py "
+          f"(--extraction {args.extraction}):")
+    print("  " + " ".join(flags))
 
 
 if __name__ == "__main__":

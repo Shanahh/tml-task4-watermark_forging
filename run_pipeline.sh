@@ -4,7 +4,8 @@ set -eo pipefail
 # Usage:
 #   ./run_pipeline.sh [--wm1-strength 0.0024] \
 #                      [--wm3-y-strength 0.0079] [--wm3-cb-strength 0.0017] [--wm3-cr-strength 0.0017] \
-#                      [--wm4-strength 0.0091] [--wm5-strength 0.0071] [--wm6-strength 0.04]
+#                      [--wm4-strength 0.0091] [--wm5-strength 0.0071] [--wm6-strength 0.04] \
+#                      [--extraction highpass|denoiser]
 #
 # Strength is per-category (and per-channel for WM_3). The defaults below are
 # AMPLITUDE-CALIBRATED by calibrate_strength.py: they reproduce the genuine
@@ -14,6 +15,17 @@ set -eo pipefail
 # images -- which can lower the real decoder's bit accuracy (Sdet) and also
 # costs Sqlt. Run ./calibrate_strength.py to re-derive these (e.g. if the
 # templates change) and update the defaults to whatever it reports as s*.
+#
+# --extraction (default highpass) selects how the WM_1/3/5 channel attacks
+# estimate clean content. 'denoiser' is an OPT-IN experiment: it isolates the
+# watermark with a wavelet denoiser (the Watermark Copy Attack) instead of a
+# gaussian high-pass, giving a different -- hopefully cleaner -- template
+# DIRECTION. Both templates are unit-std normalized, so running
+# '--extraction denoiser' with the same calibrated strengths above holds the
+# perturbation AMPLITUDE fixed and swaps only the direction -- a clean
+# single-variable test of "is the denoiser's delta estimate better?". Run this
+# only AFTER confirming the default highpass run, so the two differ in exactly
+# one variable.
 
 PROJECT=/home/atml_team052/tml-task4-watermark_forging
 ENV=/home/atml_team052/.conda/envs/tmltask4
@@ -30,6 +42,7 @@ WM3_CR_STRENGTH="0.0017"
 WM4_STRENGTH="0.0091"
 WM5_STRENGTH="0.0071"
 WM6_STRENGTH="0.04"
+EXTRACTION="highpass"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         --wm4-strength) WM4_STRENGTH="$2"; shift 2 ;;
         --wm5-strength) WM5_STRENGTH="$2"; shift 2 ;;
         --wm6-strength) WM6_STRENGTH="$2"; shift 2 ;;
+        --extraction) EXTRACTION="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -129,10 +143,11 @@ echo "=== [2/6] Baseline (all categories) ==="
 #    model's transferability to the real detector.
 # ---------------------------------------------------------------------------
 echo "=== [3/6] Specialized candidates (WM_1, WM_3, WM_4, WM_5, WM_6) ==="
-echo "strengths: WM_1=$WM1_STRENGTH WM_3(Y/Cb/Cr)=$WM3_Y_STRENGTH/$WM3_CB_STRENGTH/$WM3_CR_STRENGTH WM_4=$WM4_STRENGTH WM_5=$WM5_STRENGTH WM_6=$WM6_STRENGTH"
+echo "extraction=$EXTRACTION strengths: WM_1=$WM1_STRENGTH WM_3(Y/Cb/Cr)=$WM3_Y_STRENGTH/$WM3_CB_STRENGTH/$WM3_CR_STRENGTH WM_4=$WM4_STRENGTH WM_5=$WM5_STRENGTH WM_6=$WM6_STRENGTH"
 "$PYTHON" "$PROJECT/forge_specialized.py" \
     --dataset "$DATASET" \
     --output-dir "$PROJECT/specialized_candidates" \
+    --extraction "$EXTRACTION" \
     --wm1-strength "$WM1_STRENGTH" \
     --wm3-y-strength "$WM3_Y_STRENGTH" \
     --wm3-cb-strength "$WM3_CB_STRENGTH" \
@@ -144,8 +159,11 @@ echo "strengths: WM_1=$WM1_STRENGTH WM_3(Y/Cb/Cr)=$WM3_Y_STRENGTH/$WM3_CB_STRENG
 # Informational: confirm the specialized strengths land within the genuine
 # watermark amplitude cluster (z@now ~ 0 = match). A large |z| means the
 # chosen strength over/under-drives the real watermark -- re-derive with
-# calibrate_strength.py if so. Does not stop the pipeline.
-echo "--- strength calibration check ---"
+# calibrate_strength.py if so. Does not stop the pipeline. Always checked
+# against highpass: the amplitude is held at the highpass-calibrated values
+# even for the denoiser experiment (which swaps direction only), so highpass
+# is the canonical amplitude reference.
+echo "--- strength calibration check (highpass amplitude reference) ---"
 "$PYTHON" "$PROJECT/calibrate_strength.py" \
     --dataset "$DATASET" \
     --wm1-strength "$WM1_STRENGTH" \

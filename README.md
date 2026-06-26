@@ -276,6 +276,23 @@ Reassuringly, every calibrated `s*` sits at or below the LPIPS knee — so match
 
 The calibrated `s*` values are now `forge_specialized.py`'s and `run_pipeline.sh`'s defaults — pass `--wm1-strength` / `--wm3-y-strength` / `--wm3-cb-strength` / `--wm3-cr-strength` / `--wm4-strength` / `--wm5-strength` to either to override them if `calibrate_strength.py` reports different `s*` after a template change.
 
+### Opt-in next lever: denoiser extraction (`--extraction denoiser`)
+
+Calibration fixes the perturbation's *magnitude*; it can't fix its *direction*. If the extracted template `δ̂` is a poor estimate of the true embedded `δ`, the forgery is correctly-scaled but still points the wrong way and won't decode. The channel attacks (WM_1/3/5) recover `δ̂` as `channel − estimated_clean_content`; how the clean content is estimated determines how cleanly `δ̂` isolates the watermark:
+
+- **`highpass`** (default): clean ≈ gaussian-blurred channel. Cheap, but it keeps sharp edges/texture (high-frequency *content*) in the residual, leaking content into `δ̂`.
+- **`denoiser`** (opt-in): clean ≈ a wavelet (BayesShrink) denoiser — the classic Watermark Copy Attack estimator. For a noise-like spread-spectrum watermark this isolates `δ̂` far better, because the denoiser removes the noise-like watermark across all bands while *preserving* content. (Falls back to a scipy median filter if PyWavelets is missing.)
+
+The two templates correlate only ~0.34 — they genuinely point in different directions. Run it as a clean **single-variable experiment**: both templates are unit-std normalized, so reusing the highpass-calibrated strengths holds the amplitude fixed and swaps only the direction:
+
+```bash
+./run_pipeline.sh --extraction denoiser      # same calibrated strengths, denoiser delta-hat
+```
+
+Only run this *after* confirming the default highpass submission, so the two differ in exactly one variable and the leaderboard delta is attributable. The denoiser only changes WM_1/3/5 (WM_4 phase and WM_6 DCT are untouched).
+
+Caveat on calibrating the denoiser directly: `calibrate_strength.py --extraction denoiser` exists for diagnostics, but its `s*` is **unreliable** because denoising is nonlinear (its "projection is linear in strength" assumption breaks). Hold amplitude at the highpass `s*` instead, as above. The denoiser diagnostic did suggest it finds *weaker* consistent signal for WM_3 (near-zero `s*`) than highpass — consistent with WM_3's watermark not being a high-frequency noise component — so if the all-categories denoiser run regresses, try it on WM_1/WM_5 only.
+
 ## 9. Generate the generic mean-residual baseline
 
 Run for any subset of categories (defaults to all 8):
@@ -547,7 +564,7 @@ Therefore:
 - surrogate attacks may not transfer to the hidden detector, even when the transfer check above looks favorable — agreement between two of your own surrogates is necessary but not sufficient evidence of transfer to the real detector;
 - **we have no local measurement of Sdet** (the real decoder's bit accuracy) — only of Sqlt (LPIPS). This is the single biggest constraint: every Sdet-affecting choice is validated only by the once-an-hour leaderboard scalar, which makes the loop nearly open. The partial fix is to build local proxies that *should* correlate with Sdet (the amplitude calibration, the surrogate transfer check) and only submit changes those proxies endorse;
 - strength is NOT "as much as the quality budget allows" — it is the genuine watermark's own amplitude, read off the sources by `calibrate_strength.py`. Maximizing within the LPIPS budget actively overshot the real watermark by 15–44σ on most channels and caused a regression. "Looks fine visually" / "Sqlt is high" only constrains the quality half, and says nothing about whether the strength reproduces the watermark;
-- amplitude calibration fixes the *magnitude* of the perturbation, not its *direction* — if the extracted template `δ̂` is a poor estimate of the true embedded `δ`, the forgery will be correctly-scaled but still point the wrong way and won't decode. Improving extraction (e.g. a denoiser-based estimate, the Watermark Copy Attack) is the next lever once amplitude is correct;
+- amplitude calibration fixes the *magnitude* of the perturbation, not its *direction* — if the extracted template `δ̂` is a poor estimate of the true embedded `δ`, the forgery will be correctly-scaled but still point the wrong way and won't decode. Improving extraction is the next lever once amplitude is correct; the `--extraction denoiser` option (section 8) is a built, opt-in attempt at this (wavelet/Watermark-Copy-Attack estimate), to be tested as a single-variable swap after the highpass run;
 - a hand-crafted attack with a higher diagnostic AUC is not necessarily what the real detector reads — when more than one statistically independent domain shows significant evidence for the same category (as with WM_5's LSB and residual signals), prefer combining them over picking only the highest-AUC one;
 - a feature that is correct *in memory* may not be correct *on disk* — `apply_lsb`'s original implementation set bits on a derived floating-point YCbCr value and lost 100% of them on the PNG round trip, and a second, independent bug (fixing two channels sequentially undoing each other via cross-channel coupling) was found the same way. Any attack that depends on exact pixel values, not just a statistical direction, needs a save-and-reload round-trip check (`check_lsb_roundtrip.py`) before being trusted, not just an in-memory unit test.
 
