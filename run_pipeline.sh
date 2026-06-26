@@ -87,9 +87,13 @@ echo "=== [2/6] Baseline (all categories) ==="
 
 # ---------------------------------------------------------------------------
 # 4. Specialized hand-crafted attacks (validated signal exists):
-#    WM_1 Cb residual, WM_4 Fourier-phase, WM_5 LSB bit-plane, WM_6 DCT.
+#    WM_1 Cb residual, WM_3 combined Y/Cb/Cr residual, WM_4 Fourier-phase,
+#    WM_5 residual+LSB bit-plane, WM_6 DCT. WM_3 also has a surrogate+PGD
+#    path below (kept for ablation comparison) but routes here by default
+#    in step 8, since this attack doesn't depend on a black-box proxy
+#    model's transferability to the real detector.
 # ---------------------------------------------------------------------------
-echo "=== [3/6] Specialized candidates (WM_1, WM_4, WM_5, WM_6) ==="
+echo "=== [3/6] Specialized candidates (WM_1, WM_3, WM_4, WM_5, WM_6) ==="
 "$PYTHON" "$PROJECT/forge_specialized.py" \
     --dataset "$DATASET" \
     --output-dir "$PROJECT/specialized_candidates" \
@@ -97,7 +101,9 @@ echo "=== [3/6] Specialized candidates (WM_1, WM_4, WM_5, WM_6) ==="
 
 # ---------------------------------------------------------------------------
 # 5. Surrogate-classifier ensembles for categories with no validated
-#    hand-crafted signal: WM_2, WM_3, WM_7, WM_8.
+#    hand-crafted signal: WM_2, WM_7, WM_8. (WM_3 is also trained here for
+#    ablation comparison against its hand-crafted attack above, but routing
+#    in step 8 prefers the hand-crafted attack for WM_3 by default.)
 #
 #    Three structurally different architectures are trained per category.
 #    cnn_a + cnn_b together are the attack ensemble forge_pgd.py optimizes
@@ -163,12 +169,13 @@ done
 #    select_routing.py reads the transfer_check_*.json verdicts from step 6
 #    and automatically falls back to the mean-residual baseline for any
 #    surrogate category whose attack did not come back "likely to transfer" --
-#    this is the actual decision logic, not a manual edit. WM_1/4/5/6 (the
-#    validated hand-crafted attacks) are always routed to specialized
-#    candidates regardless, since they don't depend on a black-box surrogate.
-#    Inspect routing.json afterwards and re-run category ablations before
-#    treating this as final -- the chosen strength/eps (0.005 / 2-255) are
-#    starting points, not necessarily the best-scoring combination.
+#    this is the actual decision logic, not a manual edit. WM_1/3/4/5/6 (the
+#    validated hand-crafted attacks, including WM_3's by default now) are
+#    always routed to specialized candidates regardless, since they don't
+#    depend on a black-box surrogate. Inspect routing.json afterwards and
+#    re-run category ablations before treating this as final -- the chosen
+#    strength/eps (0.005 / 2-255) are starting points, not necessarily the
+#    best-scoring combination.
 # ---------------------------------------------------------------------------
 echo "=== [7/7] Build submission ==="
 ROUTING="$PROJECT/routing.json"

@@ -3,14 +3,25 @@
 a validated, domain-specific statistical signal in diagnose_watermarks_validated.py:
 
     WM_1  Cb-channel high-pass residual template
+    WM_3  combined Y/Cb/Cr high-pass residual templates (all three channels
+          show strong, independent evidence -- Y_auc/Cb_auc/Cr_auc all
+          ~0.97-0.99 -- so this sidesteps the surrogate+PGD transferability
+          question entirely for this category, the same way WM_1's Cb
+          template does for its one strong channel)
     WM_4  coherent Fourier-phase template
     WM_5  Cb/Cr residual template *and* Cb/Cr LSB bit-plane copy (combined,
           since both domains show independent, significant evidence and the
           LSB edit costs essentially no extra perceptual budget)
     WM_6  block-DCT coefficient distribution matching
 
-All other categories are left untouched here; they are handled by the
-surrogate-classifier + PGD pipeline (train_surrogate.py / forge_pgd.py).
+WM_3 also has a surrogate-classifier + PGD path (train_surrogate.py /
+forge_pgd.py) kept around for ablation comparison, but the hand-crafted
+attack here is the default routing choice since it doesn't depend on a
+black-box proxy model's transferability to the real detector.
+
+WM_2, WM_7, WM_8 are left untouched here; they are handled by the
+surrogate-classifier + PGD pipeline only, since they show no validated
+hand-crafted signal at all.
 """
 from __future__ import annotations
 
@@ -51,6 +62,14 @@ def apply_channel(x, template, ch, strength):
     y = rgb_to_ycbcr(x)
     y[..., ch] = np.clip(y[..., ch] + strength * template, 0, 1)
     return ycbcr_to_rgb(y)
+
+
+# --------------------------------------------------------------------------
+# WM_3: combined Y/Cb/Cr channel templates (reuses channel_template/
+# apply_channel above, which already work for any YCbCr channel index)
+# --------------------------------------------------------------------------
+
+WM3_CHANNELS = (0, 1, 2)  # Y, Cb, Cr -- all independently strong for WM_3
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +189,7 @@ def main():
         by_resolution.setdefault((im.shape[1], im.shape[0]), []).append(im)
 
     wm1_cb_template = channel_template(src["WM_1"], 1)
+    wm3_channel_templates = {ch: channel_template(src["WM_3"], ch) for ch in WM3_CHANNELS}
     wm4_phase_template = phase_template(src["WM_4"], args.wm4_threshold)
     wm5_cb_template = channel_template(src["WM_5"], 1)
     wm5_cr_template = channel_template(src["WM_5"], 2)
@@ -189,6 +209,10 @@ def main():
         for i, x in clean.items():
             if 1 <= i <= 25:
                 y = apply_channel(x, wm1_cb_template, 1, strength)
+            elif 51 <= i <= 75:
+                y = x
+                for ch in WM3_CHANNELS:
+                    y = apply_channel(y, wm3_channel_templates[ch], ch, strength)
             elif 76 <= i <= 100:
                 y = apply_luma(x, wm4_phase_template, strength)
             elif 101 <= i <= 125:

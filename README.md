@@ -161,18 +161,20 @@ A feature should only be treated as useful when:
 
 ## 6. Current attack routing
 
-| Category | Primary attack | Fallback / ablation baseline |
-|---|---|---|
-| WM_1 | Cb-channel residual transfer | mean-residual baseline (`forge_baseline.py`) |
-| WM_2 | surrogate-classifier + constrained PGD (no validated hand-crafted signal) | mean-residual baseline |
-| WM_3 | residual CNN ensemble with constrained PGD | mean-residual baseline |
-| WM_4 | coherent Fourier-phase template | mean-residual baseline |
-| WM_5 | Cb/Cr residual transfer **combined with** Cb/Cr LSB-plane bit transfer | mean-residual baseline |
-| WM_6 | block-DCT coefficient distribution matching | mean-residual baseline |
-| WM_7 | surrogate-classifier + constrained PGD (no validated hand-crafted signal) | mean-residual baseline |
-| WM_8 | surrogate-classifier + constrained PGD (no validated hand-crafted signal) | mean-residual baseline |
+| Category | Primary attack | Ablation alternative | Fallback baseline |
+|---|---|---|---|
+| WM_1 | Cb-channel residual transfer | — | mean-residual baseline (`forge_baseline.py`) |
+| WM_2 | surrogate-classifier + constrained PGD (no validated hand-crafted signal) | — | mean-residual baseline |
+| WM_3 | combined Y/Cb/Cr residual transfer | surrogate-classifier + constrained PGD | mean-residual baseline |
+| WM_4 | coherent Fourier-phase template | — | mean-residual baseline |
+| WM_5 | Cb/Cr residual transfer **combined with** Cb/Cr LSB-plane bit transfer | — | mean-residual baseline |
+| WM_6 | block-DCT coefficient distribution matching | — | mean-residual baseline |
+| WM_7 | surrogate-classifier + constrained PGD (no validated hand-crafted signal) | — | mean-residual baseline |
+| WM_8 | surrogate-classifier + constrained PGD (no validated hand-crafted signal) | — | mean-residual baseline |
 
-WM_2/7/8 showed no statistically significant hand-crafted feature (residual/channel/LSB/DCT/spectral AUC all ≈0.5, high permutation p-values) — these are routed to the generic surrogate+PGD pipeline instead (same mechanism as WM_3, now parametrized by `--category`).
+WM_2/7/8 showed no statistically significant hand-crafted feature (residual/channel/LSB/DCT/spectral AUC all ≈0.5, high permutation p-values) — these are routed to the generic surrogate+PGD pipeline instead.
+
+WM_3 shows strong, independent evidence across all three channels (`Y_auc≈0.99`, `Cb_auc≈0.98`, `Cr_auc≈0.97`) — comparable in strength to WM_1/4/5/6. It originally used the surrogate+PGD mechanism (since that's how this pipeline first treated it), but in practice the surrogate's transfer check consistently came back `"weak or partial transfer"` even after switching to an ensemble attack — i.e. real signal, but the black-box proxy model doesn't generalize enough to the unseen detector at the tested eps/step budget. Since WM_3's own diagnostics are this strong, there's no need to go through a proxy model at all: `forge_specialized.py` now applies the same channel-template transfer used for WM_1, just across Y/Cb/Cr simultaneously instead of one channel. This is the default routing; the surrogate+PGD path for WM_3 is kept available for ablation comparison (`--category WM_3` works with `train_surrogate.py`/`forge_pgd.py`/`check_surrogate_transfer.py` exactly as before).
 
 WM_5 showed near-perfect LSB separability (AUC ≈ 0.995) but no luma signal at all (Y_auc ≈ 0.5), and *also* strong Cb/Cr residual separability (AUC ≈ 0.96/0.91). Both domains are statistically independent evidence, so the attack applies both: the continuous residual transfer (as for WM_1) plus the LSB bit-plane copy. The LSB edit costs effectively zero extra perceptual budget, so there's no reason to pick one domain over the other — earlier versions of this attack used LSB only, which risked silently discarding a working continuous-domain signal if the real detector doesn't read literal LSB bits.
 
@@ -204,11 +206,12 @@ specialized_candidates/
 The script modifies:
 
 - WM_1 targets with a Cb-channel residual template;
+- WM_3 targets with combined Y/Cb/Cr residual templates;
 - WM_4 targets with a coherent Fourier-phase template;
 - WM_5 targets with a Cb/Cr residual template (scaled by strength) *and* a direct Cb/Cr **LSB bit-plane** copy (no strength scaling — a single bit per pixel is already imperceptible);
 - WM_6 targets with selected 8×8 DCT coefficient adjustments.
 
-All other targets (WM_2, WM_3, WM_7, WM_8) remain unchanged in this script's output — they are handled by the surrogate+PGD pipeline below.
+All other targets (WM_2, WM_7, WM_8) remain unchanged in this script's output — they are handled by the surrogate+PGD pipeline below.
 
 ## 8. Generate the generic mean-residual baseline
 
@@ -374,15 +377,15 @@ Do not evaluate only one fully combined submission.
 Test these variants separately:
 
 1. mean-residual baseline only, for every category;
-2. each specialized attack in isolation (WM_1, WM_4, WM_5, WM_6);
-3. each surrogate+PGD attack in isolation (WM_2, WM_3, WM_7, WM_8);
+2. each specialized attack in isolation (WM_1, WM_3, WM_4, WM_5, WM_6);
+3. each surrogate+PGD attack in isolation (WM_2, WM_7, WM_8, and WM_3 as an ablation comparison against its specialized attack);
 4. combined best-performing routing across all 8 categories.
 
 Only combine attacks that produce measurable improvements over the mean-residual baseline for that category.
 
 Recommended initial sweeps:
 
-### WM_1, WM_4 (continuous-strength specialized attacks)
+### WM_1, WM_3, WM_4 (continuous-strength specialized attacks)
 
 ```text
 0.0025
@@ -393,9 +396,9 @@ Recommended initial sweeps:
 
 ### WM_5
 
-The residual half uses the same strength grid as WM_1/WM_4. The LSB half has no strength knob — it is a binary bit-plane copy applied at full strength regardless. Worth ablating the two halves independently (residual only, LSB only, both) in case one of them doesn't correspond to what the real detector reads.
+The residual half uses the same strength grid as WM_1/WM_3/WM_4. The LSB half has no strength knob — it is a binary bit-plane copy applied at full strength regardless. Worth ablating the two halves independently (residual only, LSB only, both) in case one of them doesn't correspond to what the real detector reads.
 
-### WM_2, WM_3, WM_7, WM_8 (surrogate+PGD)
+### WM_2, WM_7, WM_8 (surrogate+PGD; WM_3 too, for ablation comparison only)
 
 ```text
 1/255

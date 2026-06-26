@@ -3,10 +3,14 @@
 the mean-residual baseline for any surrogate+PGD category whose transfer
 check (check_surrogate_transfer.py) did not come back "likely to transfer".
 
-Categories with a validated hand-crafted attack (WM_1/4/5/6 by default) are
+Categories with a validated hand-crafted attack (WM_1/3/4/5/6 by default) are
 always routed to the specialized candidates -- the transfer check only
 applies to the surrogate-driven categories, since the hand-crafted attacks
-don't rely on a black-box proxy model at all.
+don't rely on a black-box proxy model at all. WM_3 has a surrogate+PGD path
+too (kept for ablation comparison, since it was the original mechanism used
+for it), but defaults to the hand-crafted attack here since that sidesteps
+the transferability question entirely and WM_3's own diagnostics are strong
+enough (Y/Cb/Cr_auc all ~0.97-0.99) to justify it.
 """
 from __future__ import annotations
 
@@ -16,8 +20,8 @@ from pathlib import Path
 
 from common import CATEGORIES, write_json
 
-DEFAULT_SPECIALIZED_CATEGORIES = ["WM_1", "WM_4", "WM_5", "WM_6"]
-DEFAULT_SURROGATE_CATEGORIES = ["WM_2", "WM_3", "WM_7", "WM_8"]
+DEFAULT_SPECIALIZED_CATEGORIES = ["WM_1", "WM_3", "WM_4", "WM_5", "WM_6"]
+DEFAULT_SURROGATE_CATEGORIES = ["WM_2", "WM_7", "WM_8"]
 
 
 def parse_args():
