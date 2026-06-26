@@ -1,6 +1,21 @@
 #!/bin/bash
 set -eo pipefail
 
+# Usage:
+#   ./run_pipeline.sh [--specialized-strength 0.04] [--strength-grid 0.0025,0.005,0.01,0.02,0.04,0.08]
+#
+# --specialized-strength is the value actually used for the final submission
+# routing (passed to select_routing.py). It MUST also appear in
+# --strength-grid (forge_specialized.py needs to have generated a candidate
+# folder at that exact strength) -- the script checks this and fails fast
+# with a clear error otherwise, rather than silently falling back to clean
+# images at build_submission time.
+#
+# Run ./run_lpips_sweep.sh first to find a real, LPIPS-validated strength
+# instead of guessing -- the previous default (0.005) left almost all of the
+# perceptual quality budget unused (Sqlt=0.99 at that strength for WM_1),
+# which is the likely dominant reason for a capped score.
+
 PROJECT=/home/atml_team052/tml-task4-watermark_forging
 ENV=/home/atml_team052/.conda/envs/tmltask4
 PYTHON="$ENV/bin/python"
@@ -8,6 +23,17 @@ PYTHON="$ENV/bin/python"
 export PYTHONNOUSERSITE=1
 export HF_HOME=/home/atml_team052/.cache/huggingface
 export PIP_CACHE_DIR=/home/atml_team052/.cache/pip
+
+SPECIALIZED_STRENGTH="0.005"
+STRENGTH_GRID="0.0025,0.005,0.01,0.02"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --specialized-strength) SPECIALIZED_STRENGTH="$2"; shift 2 ;;
+        --strength-grid) STRENGTH_GRID="$2"; shift 2 ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
 
 # ---------------------------------------------------------------------------
 # 1. Environment setup (idempotent: only built if missing)
@@ -94,10 +120,11 @@ echo "=== [2/6] Baseline (all categories) ==="
 #    model's transferability to the real detector.
 # ---------------------------------------------------------------------------
 echo "=== [3/6] Specialized candidates (WM_1, WM_3, WM_4, WM_5, WM_6) ==="
+echo "strength grid: $STRENGTH_GRID (routing will use strength=$SPECIALIZED_STRENGTH)"
 "$PYTHON" "$PROJECT/forge_specialized.py" \
     --dataset "$DATASET" \
     --output-dir "$PROJECT/specialized_candidates" \
-    --strength-grid 0.0025,0.005,0.01,0.02
+    --strength-grid "$STRENGTH_GRID"
 
 # ---------------------------------------------------------------------------
 # 5. Surrogate-classifier ensembles for categories with no validated
@@ -178,9 +205,22 @@ done
 #    best-scoring combination.
 # ---------------------------------------------------------------------------
 echo "=== [7/7] Build submission ==="
+
+# Canonicalize the strength string the same way Python's f"{s:g}" formats it,
+# so this matches the folder name forge_specialized.py actually created
+# (e.g. "0.040" -> "0.04"), and fail fast if that folder doesn't exist
+# instead of build_submission.py silently falling back to clean images.
+SPECIALIZED_STRENGTH_CANON=$("$PYTHON" -c "print(f'{float(\"$SPECIALIZED_STRENGTH\"):g}')")
+SPECIALIZED_STRENGTH_DIR="$PROJECT/specialized_candidates/strength_${SPECIALIZED_STRENGTH_CANON}"
+if [ ! -d "$SPECIALIZED_STRENGTH_DIR" ]; then
+    echo "ERROR: $SPECIALIZED_STRENGTH_DIR does not exist." >&2
+    echo "--specialized-strength ($SPECIALIZED_STRENGTH) must also be included in --strength-grid ($STRENGTH_GRID)." >&2
+    exit 1
+fi
+
 ROUTING="$PROJECT/routing.json"
 "$PYTHON" "$PROJECT/select_routing.py" \
-    --specialized-dir "$PROJECT/specialized_candidates" --specialized-strength 0.005 \
+    --specialized-dir "$PROJECT/specialized_candidates" --specialized-strength "$SPECIALIZED_STRENGTH_CANON" \
     --baseline-dir "$PROJECT/baseline_candidates" --baseline-strength 0.02 \
     --pgd-dir "$PROJECT/pgd_candidates" --pgd-eps 0.007843 \
     --transfer-checks-dir "$PROJECT" \

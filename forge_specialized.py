@@ -84,12 +84,96 @@ def lsb_template(xs, ch):
     return (np.mean(np.stack(bits), 0) >= 0.5).astype(np.uint8)
 
 
-def apply_lsb(x, template, ch):
-    y = rgb_to_ycbcr(x)
-    c = np.round(y[..., ch] * 255).astype(np.uint8)
-    c = (c & 0xFE) | template
-    y[..., ch] = c.astype(np.float32) / 255.0
-    return ycbcr_to_rgb(y)
+def apply_lsb(x, template, ch, max_delta=6):
+    """Set the LSB of the saved Cb/Cr byte to `template`, exactly, after the
+    PNG save/reload round trip.
+
+    Setting the bit on the *derived* floating-point YCbCr value and
+    converting back to RGB does NOT work: save_rgb rounds the resulting RGB
+    to uint8 for the PNG, and re-deriving YCbCr from that rounded RGB after
+    reload essentially never reproduces the intended Cb/Cr byte exactly
+    (confirmed empirically: 100% bit mismatch in practice). Cb is dominated
+    by the Blue channel (weight 0.5) and Cr by the Red channel (weight 0.5),
+    so instead this perturbs only that one RGB channel, by the smallest
+    integer delta, until the resulting Cb/Cr byte -- computed exactly as it
+    will be after the uint8 RGB round trip -- has the desired LSB.
+    """
+    assert ch in (1, 2)
+    driver = 2 if ch == 1 else 0  # Cb <- Blue, Cr <- Red
+
+    rgb_u8 = np.clip(np.round(x * 255), 0, 255).astype(np.int16)
+    r, g, b = (rgb_u8[..., 0].astype(np.float64), rgb_u8[..., 1].astype(np.float64),
+               rgb_u8[..., 2].astype(np.float64))
+
+    best_delta = np.zeros(rgb_u8.shape[:2], dtype=np.int16)
+    found = np.zeros(rgb_u8.shape[:2], dtype=bool)
+
+    for delta in sorted(range(-max_delta, max_delta + 1), key=abs):
+        candidate = np.clip(rgb_u8[..., driver].astype(np.int16) + delta, 0, 255).astype(np.float64)
+        rr, gg, bb = r, g, b
+        if driver == 2:
+            bb = candidate
+        else:
+            rr = candidate
+        if ch == 1:
+            component = -0.168736 * rr / 255 - 0.331264 * gg / 255 + 0.5 * bb / 255 + 0.5
+        else:
+            component = 0.5 * rr / 255 - 0.418688 * gg / 255 - 0.081312 * bb / 255 + 0.5
+        byte = np.round(component * 255).astype(np.int16) & 1
+        match = (byte == template) & ~found
+        best_delta = np.where(match, delta, best_delta)
+        found = found | match
+        if found.all():
+            break
+
+    out = rgb_u8.astype(np.int16).copy()
+    out[..., driver] = np.clip(out[..., driver] + best_delta, 0, 255)
+    return out.astype(np.float32) / 255.0
+
+
+def apply_lsb_pair(x, cb_template, cr_template, max_delta=4):
+    """Set both the Cb and Cr LSBs at once, exactly, after the PNG round trip.
+
+    Calling apply_lsb() twice in sequence (once per channel) does NOT work:
+    fixing Cr nudges the Red channel, but Cb's formula has a non-zero Red
+    coefficient (-0.168736), so that nudge can flip the Cb bit that was just
+    set (confirmed empirically: ~9% mismatch on the combined attack output,
+    vs <0.3% for either channel fixed in isolation). This solves for a joint
+    (delta_red, delta_blue) pair per pixel that satisfies both bits at once,
+    smallest combined magnitude first, instead of fixing them independently.
+    """
+    rgb_u8 = np.clip(np.round(x * 255), 0, 255).astype(np.int16)
+    r0, g0, b0 = (rgb_u8[..., 0].astype(np.float64), rgb_u8[..., 1].astype(np.float64),
+                  rgb_u8[..., 2].astype(np.float64))
+
+    best_dr = np.zeros(rgb_u8.shape[:2], dtype=np.int16)
+    best_db = np.zeros(rgb_u8.shape[:2], dtype=np.int16)
+    found = np.zeros(rgb_u8.shape[:2], dtype=bool)
+
+    deltas = range(-max_delta, max_delta + 1)
+    candidates = sorted(
+        ((dr, db) for dr in deltas for db in deltas),
+        key=lambda d: (max(abs(d[0]), abs(d[1])), abs(d[0]) + abs(d[1])),
+    )
+
+    for dr, db in candidates:
+        rr = np.clip(r0 + dr, 0, 255)
+        bb = np.clip(b0 + db, 0, 255)
+        cb_norm = -0.168736 * rr / 255 - 0.331264 * g0 / 255 + 0.5 * bb / 255 + 0.5
+        cr_norm = 0.5 * rr / 255 - 0.418688 * g0 / 255 - 0.081312 * bb / 255 + 0.5
+        cb_byte = np.round(cb_norm * 255).astype(np.int16) & 1
+        cr_byte = np.round(cr_norm * 255).astype(np.int16) & 1
+        match = (cb_byte == cb_template) & (cr_byte == cr_template) & ~found
+        best_dr = np.where(match, dr, best_dr)
+        best_db = np.where(match, db, best_db)
+        found = found | match
+        if found.all():
+            break
+
+    out = rgb_u8.astype(np.int16).copy()
+    out[..., 0] = np.clip(out[..., 0] + best_dr, 0, 255)
+    out[..., 2] = np.clip(out[..., 2] + best_db, 0, 255)
+    return out.astype(np.float32) / 255.0
 
 
 # --------------------------------------------------------------------------
@@ -218,8 +302,7 @@ def main():
             elif 101 <= i <= 125:
                 y = apply_channel(x, wm5_cb_template, 1, strength)
                 y = apply_channel(y, wm5_cr_template, 2, strength)
-                y = apply_lsb(y, wm5_cb_lsb, 1)
-                y = apply_lsb(y, wm5_cr_lsb, 2)
+                y = apply_lsb_pair(y, wm5_cb_lsb, wm5_cr_lsb)
             elif 126 <= i <= 150:
                 y = apply_dct(x, wm6_coords, wm6_stats, wm6_clean_stats, min(1, strength * 25))
             else:

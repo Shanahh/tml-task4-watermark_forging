@@ -27,6 +27,9 @@ tml-task4-watermark_forging/
 ├── inspect_outputs.py
 ├── diagnose_watermarks_validated.py
 ├── forge_specialized.py
+├── check_lsb_roundtrip.py
+├── sweep_lpips_strength.py
+├── run_lpips_sweep.sh
 ├── forge_baseline.py
 ├── train_surrogate.py
 ├── forge_pgd.py
@@ -35,6 +38,7 @@ tml-task4-watermark_forging/
 ├── forge_wm3_pgd.py         # deprecated thin wrapper -> forge_pgd.py --category WM_3
 ├── select_routing.py
 ├── build_submission.py
+├── run_pipeline.sh
 │
 ├── diagnostics_validated/
 ├── baseline_candidates/
@@ -42,6 +46,7 @@ tml-task4-watermark_forging/
 ├── surrogates/
 ├── pgd_candidates/
 ├── transfer_check_wm_*.json
+├── lpips_strength_sweep.json
 └── final_submission/
 ```
 
@@ -213,7 +218,32 @@ The script modifies:
 
 All other targets (WM_2, WM_7, WM_8) remain unchanged in this script's output — they are handled by the surrogate+PGD pipeline below.
 
-## 8. Generate the generic mean-residual baseline
+### A real bug that was found and fixed here: the WM_5 LSB attack didn't survive saving as a PNG
+
+An earlier version of `apply_lsb()` set the target bit on the *derived floating-point* Cb/Cr value, then converted back to RGB. `save_rgb()` rounds that RGB to uint8 for the PNG, and re-deriving Cb/Cr from the *rounded RGB* after reload does not reproduce the intended byte — confirmed empirically, **100% of bits were lost** this way. `apply_lsb()` now works directly in the integer RGB domain that's actually persisted (Cb is dominated by the Blue channel, Cr by Red; it searches for the smallest integer delta to that one channel that produces the desired bit after rounding).
+
+There was a second, subtler bug discovered the same way: fixing Cb and Cr **sequentially** (call `apply_lsb` for Cb, then again for Cr) doesn't work either, because Cb's formula has a non-zero Red coefficient — fixing Cr nudges Red, which can flip the Cb bit that was just set (~9% combined mismatch, vs <0.3% for either channel fixed alone). `apply_lsb_pair()` solves for both channels' deltas jointly instead. Run `check_lsb_roundtrip.py` to verify this end-to-end against a real PNG save/reload:
+
+```bash
+python check_lsb_roundtrip.py \
+    --dataset /home/atml_team052/tml-task4-watermark_forging/dataset \
+    --scratch-dir /home/atml_team052/tml-task4-watermark_forging/lsb_roundtrip_scratch
+```
+
+It should report `PASS` with <1% bit mismatch for all three checks (Cb alone, Cr alone, combined). Run this any time `apply_lsb`/`apply_lsb_pair` or the YCbCr conversion code changes — this bug would have silently capped WM_5's score at whatever the (irrelevant) residual half alone contributed, with no error or warning anywhere.
+
+## 8. Find the real usable strength budget before picking one
+
+The conservative strength grid above (`0.0025`–`0.02`) was never validated against where LPIPS actually starts climbing — looking visually fine at a given strength is a sign of *unclaimed* detection budget, not evidence the strength is well-chosen, since `Sqlt = exp(-8*LPIPS)` tolerates this kind of small, high-frequency additive perturbation much better than intuition suggests. `run_lpips_sweep.sh` measures real LPIPS across a much wider strength range and prints exactly where the curve bends:
+
+```bash
+./run_lpips_sweep.sh --categories WM_1,WM_3,WM_4,WM_5,WM_6 \
+    --strength-grid 0.0025,0.005,0.01,0.02,0.05,0.1,0.2,0.3,0.4,0.5
+```
+
+Example output for WM_1: `strength=0.005 → Sqlt=0.99` (almost no cost paid, almost no detection strength bought either), `strength=0.02 → Sqlt=0.81` (where the old grid topped out), `strength=0.1 → Sqlt=0.097` (already collapsed). The real usable ceiling sits somewhere between `0.02` and `0.1`, never explored by the old default — re-run `forge_specialized.py` with a `--strength-grid` that brackets the knee you find here, then pass the chosen value to `run_pipeline.sh --specialized-strength` (see step 13).
+
+## 9. Generate the generic mean-residual baseline
 
 Run for any subset of categories (defaults to all 8):
 
@@ -227,7 +257,7 @@ python forge_baseline.py \
 
 This computes the mean high-pass residual across each group's 25 source images and additively transfers it to the matching clean targets. Use it as the ablation reference point for every category, and in particular as the working attack for any category where no stronger specialized or surrogate result is available.
 
-## 9. Train surrogate-classifier ensembles (WM_2, WM_3, WM_7, WM_8)
+## 10. Train surrogate-classifier ensembles (WM_2, WM_3, WM_7, WM_8)
 
 `train_surrogate.py` is parametrized by `--category` and `--arch` (`cnn_a`, `cnn_b`, `cnn_c` — three structurally different architectures) and is used for every group with no validated hand-crafted signal (WM_2, WM_7, WM_8), plus WM_3 which already used this mechanism.
 
@@ -262,7 +292,7 @@ surrogates/
 
 Each detector uses a different random seed and train/validation split.
 
-## 10. Check whether the attack is likely to transfer, before spending a submission on it
+## 11. Check whether the attack is likely to transfer, before spending a submission on it
 
 `check_surrogate_transfer.py` crafts PGD perturbations against the `cnn_a`+`cnn_b` ensemble (`--attack-archs`, comma-separated) and measures whether the independent `cnn_c` ensemble (`--holdout-arch`, never used in the attack) also raises its "watermarked" probability on the same images:
 
@@ -284,7 +314,7 @@ The script reports, and acts on, more than a single AUC-style number:
 
 Treat anything other than `"likely to transfer"` as a signal to improve the surrogate (more augmentation, larger negative set, bigger eps/step budget) before submitting, not as a reason to submit anyway. `select_routing.py` (step 13) automates exactly this decision.
 
-## 11. Generate PGD candidates
+## 12. Generate PGD candidates
 
 `forge_pgd.py` is parametrized the same way (`--category`, `--archs`, defaulting to `cnn_a`) and only perturbs the target-image range belonging to `--category` (per `CATEGORY_RANGES` in `common.py`). `--archs` accepts a comma-separated list to attack several architectures simultaneously, matching whatever was used in the transfer check. The quality term in the PGD loss optimizes real LPIPS directly — matching `Sqlt = exp(-8*LPIPS)` exactly — falling back to an MSE+TV proxy with a printed warning if the `lpips` package isn't installed:
 
@@ -313,7 +343,7 @@ Start with the smallest epsilon that improves held-out surrogate AUC.
 
 `train_wm3_surrogate.py` / `forge_wm3_pgd.py` remain as deprecated thin wrappers around `train_surrogate.py --category WM_3` / `forge_pgd.py --category WM_3` for backward compatibility (they only train/attack the single default `cnn_a` architecture).
 
-## 12. Inspect candidate quality
+## 13. Inspect candidate quality
 
 ```bash
 python inspect_outputs.py \
@@ -334,7 +364,7 @@ Reject candidates that:
 - substantially change image structure;
 - perform worse than the mean-residual baseline for that category.
 
-## 13. Build the final submission
+## 14. Build the final submission
 
 `build_submission.py` takes a generic per-category routing file instead of fixed flags: a JSON mapping each category to the candidate directory to use for it. Any category omitted from the file (or whose file is missing for a given id) falls back to the unmodified clean target.
 
@@ -342,12 +372,14 @@ Rather than writing `routing.json` by hand, `select_routing.py` builds it automa
 
 ```bash
 python select_routing.py \
-    --specialized-dir /home/atml_team052/tml-task4-watermark_forging/specialized_candidates --specialized-strength 0.005 \
+    --specialized-dir /home/atml_team052/tml-task4-watermark_forging/specialized_candidates --specialized-strength 0.04 \
     --baseline-dir /home/atml_team052/tml-task4-watermark_forging/baseline_candidates --baseline-strength 0.02 \
     --pgd-dir /home/atml_team052/tml-task4-watermark_forging/pgd_candidates --pgd-eps 0.007843 \
     --transfer-checks-dir /home/atml_team052/tml-task4-watermark_forging \
     --output /home/atml_team052/tml-task4-watermark_forging/routing.json
 ```
+
+`--specialized-strength` here should be whatever step 8's LPIPS sweep showed was the real usable ceiling (`0.04` above is illustrative, not a recommendation) — not the conservative default. `run_pipeline.sh --specialized-strength <value>` (step 17) passes this through automatically and validates the corresponding `specialized_candidates/strength_<value>/` folder actually exists before building the submission, rather than silently falling back to clean images if it doesn't.
 
 It prints its reasoning per category (`transfer check passed`, `transfer check failed (...)`, or `no transfer check found`) so you can see exactly why each category landed where it did. Inspect the printed output and the resulting `routing.json` before treating it as final — a `"weak or partial transfer"` verdict currently also falls back to the baseline, even though step 10 suggests that case deserves more investment (bigger eps/step budget, a better surrogate) rather than an automatic fallback; edit `routing.json` by hand afterwards if you've separately validated a stronger candidate for such a category.
 
@@ -370,7 +402,7 @@ The submission directory must contain exactly:
 
 The ZIP must contain the image files at the archive root.
 
-## 14. Ablation strategy
+## 15. Ablation strategy
 
 Do not evaluate only one fully combined submission.
 
@@ -419,7 +451,7 @@ Reduce the DCT interpolation strength if block artifacts or visible changes appe
 0.08
 ```
 
-## 15. HTCondor execution
+## 16. HTCondor execution
 
 Use absolute paths for all inputs and outputs.
 
@@ -446,25 +478,28 @@ arguments = /home/atml_team052/tml-task4-watermark_forging/run_pipeline.sh
 
 Relative output paths should be avoided because Condor executes jobs in temporary working directories.
 
-## 16. Recommended execution order
+## 17. Recommended execution order
 
 ```text
 1. Validate dataset
 2. Run validated diagnostics
 3. Review specificity and provenance controls
 4. Generate the mean-residual baseline for all categories
-5. Generate specialized candidates (WM_1, WM_4, WM_5, WM_6)
-6. Train surrogate ensembles (cnn_a, cnn_b, cnn_c) for WM_2, WM_3, WM_7, WM_8
-7. Run the cross-surrogate transfer sanity check (cnn_a+cnn_b attack vs cnn_c holdout)
-8. Generate PGD candidates (cnn_a+cnn_b ensemble attack) for WM_2, WM_3, WM_7, WM_8
-9. Inspect image quality
-10. Run category ablations against the baseline
-11. Run select_routing.py to auto-route each category based on the transfer-check verdicts
-12. Manually review and adjust routing.json for any "weak or partial transfer" categories
-13. Build the final submission ZIP
+5. Generate specialized candidates (WM_1, WM_3, WM_4, WM_5, WM_6) at a wide, exploratory strength grid
+6. Run check_lsb_roundtrip.py to verify the WM_5 LSB attack survives a real PNG save/reload
+7. Run run_lpips_sweep.sh to find the real usable strength ceiling per category, instead of guessing
+8. Re-generate specialized candidates bracketing the strength each sweep found
+9. Train surrogate ensembles (cnn_a, cnn_b, cnn_c) for WM_2, WM_3, WM_7, WM_8
+10. Run the cross-surrogate transfer sanity check (cnn_a+cnn_b attack vs cnn_c holdout)
+11. Generate PGD candidates (cnn_a+cnn_b ensemble attack) for WM_2, WM_3, WM_7, WM_8
+12. Inspect image quality
+13. Run category ablations against the baseline
+14. Run select_routing.py (or run_pipeline.sh --specialized-strength <value>) to auto-route each category
+15. Manually review and adjust routing.json for any "weak or partial transfer" categories
+16. Build the final submission ZIP
 ```
 
-## 17. Limitations
+## 18. Limitations
 
 The source images are not paired with clean versions of the same content.
 
@@ -474,7 +509,8 @@ Therefore:
 - classifiers may learn image provenance instead of watermark structure (use `check_surrogate_transfer.py` to catch this before submitting: if an independent holdout architecture doesn't agree with the attack ensemble, the perturbation is probably overfit to provenance, not the watermark);
 - category-specific statistics must be validated out of fold;
 - surrogate attacks may not transfer to the hidden detector, even when the transfer check above looks favorable — agreement between two of your own surrogates is necessary but not sufficient evidence of transfer to the real detector;
-- low perceptual distortion must take priority over aggressive optimization;
-- a hand-crafted attack with a higher diagnostic AUC is not necessarily what the real detector reads — when more than one statistically independent domain shows significant evidence for the same category (as with WM_5's LSB and residual signals), prefer combining them over picking only the highest-AUC one.
+- low perceptual distortion must take priority over aggressive optimization -- but verify this with a real LPIPS measurement (`run_lpips_sweep.sh`), not by eye: "looks fine visually" at a low strength is a sign of *unclaimed* detection budget, not evidence the strength is well-chosen, and was the likely dominant reason an earlier submission's score capped out far below what the diagnostics suggested should be reachable;
+- a hand-crafted attack with a higher diagnostic AUC is not necessarily what the real detector reads — when more than one statistically independent domain shows significant evidence for the same category (as with WM_5's LSB and residual signals), prefer combining them over picking only the highest-AUC one;
+- a feature that is correct *in memory* may not be correct *on disk* — `apply_lsb`'s original implementation set bits on a derived floating-point YCbCr value and lost 100% of them on the PNG round trip, and a second, independent bug (fixing two channels sequentially undoing each other via cross-channel coupling) was found the same way. Any attack that depends on exact pixel values, not just a statistical direction, needs a save-and-reload round-trip check (`check_lsb_roundtrip.py`) before being trusted, not just an in-memory unit test.
 
 The pipeline is experimental and should be evaluated through controlled category-level ablations.
