@@ -8,6 +8,13 @@ each clean target is perturbed within an L_inf budget to maximize the
 ensemble's "watermarked" logit while staying perceptually close to the
 original.
 
+--archs accepts a comma-separated list (e.g. "cnn_a,cnn_b") to attack several
+structurally different architectures simultaneously. This is the standard
+transferability trick: a perturbation that fools a diverse set of models at
+once tends to generalize to an unseen model far better than one optimized
+against a single architecture. See check_surrogate_transfer.py to validate
+this against a held-out architecture not included in --archs.
+
 The quality term optimizes real LPIPS directly (Sqlt = exp(-8*LPIPS) is the
 actual scoring function), falling back to an MSE+TV proxy if the `lpips`
 package is not installed.
@@ -30,7 +37,12 @@ def parse_args():
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--category", required=True, choices=CATEGORIES)
     p.add_argument("--models", type=Path, required=True)
-    p.add_argument("--arch", default="cnn_a", choices=list(ARCHITECTURES))
+    p.add_argument(
+        "--archs",
+        default="cnn_a",
+        help="comma-separated architectures to attack simultaneously, e.g. cnn_a,cnn_b "
+        f"(available: {','.join(ARCHITECTURES)})",
+    )
     p.add_argument("--output-dir", type=Path, default=Path("pgd_candidates"))
     p.add_argument("--eps-grid", default="0.0039215686,0.0078431373,0.011764706")
     p.add_argument("--steps", type=int, default=50)
@@ -69,6 +81,16 @@ def load_models(model_dir, arch, device):
         models.append(model)
     if not models:
         raise FileNotFoundError(model_dir)
+    return models
+
+
+def load_ensemble(models_root, category, archs, device):
+    """Load and concatenate the detector ensembles for every architecture in
+    `archs` (e.g. ["cnn_a", "cnn_b"]) into a single flat list of models, all
+    of which optimize() will average logits over."""
+    models = []
+    for arch in archs:
+        models += load_models(models_root / category.lower() / arch, arch, device)
     return models
 
 
@@ -116,8 +138,14 @@ def optimize(image, models, eps, args, device, quality):
 
 def main():
     args = parse_args()
+    archs = [a.strip() for a in args.archs.split(",")]
+    for arch in archs:
+        if arch not in ARCHITECTURES:
+            raise ValueError(f"unknown architecture {arch!r}, available: {list(ARCHITECTURES)}")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    models = load_models(args.models / args.category.lower() / args.arch, args.arch, device)
+    models = load_ensemble(args.models, args.category, archs, device)
+    print(f"attacking ensemble of {len(models)} models across architectures {archs}")
     _, clean = load_dataset(args.dataset)
     lo, hi = CATEGORY_RANGES[args.category]
     quality = load_quality_loss(args, device)

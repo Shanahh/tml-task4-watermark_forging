@@ -30,8 +30,10 @@ tml-task4-watermark_forging/
 ├── forge_baseline.py
 ├── train_surrogate.py
 ├── forge_pgd.py
+├── check_surrogate_transfer.py
 ├── train_wm3_surrogate.py   # deprecated thin wrapper -> train_surrogate.py --category WM_3
 ├── forge_wm3_pgd.py         # deprecated thin wrapper -> forge_pgd.py --category WM_3
+├── select_routing.py
 ├── build_submission.py
 │
 ├── diagnostics_validated/
@@ -39,6 +41,7 @@ tml-task4-watermark_forging/
 ├── specialized_candidates/
 ├── surrogates/
 ├── pgd_candidates/
+├── transfer_check_wm_*.json
 └── final_submission/
 ```
 
@@ -223,39 +226,32 @@ This computes the mean high-pass residual across each group's 25 source images a
 
 ## 9. Train surrogate-classifier ensembles (WM_2, WM_3, WM_7, WM_8)
 
-`train_surrogate.py` is parametrized by `--category` and `--arch` (`cnn_a` default, `cnn_b` an independent, structurally different architecture) and is used for every group with no validated hand-crafted signal (WM_2, WM_7, WM_8), plus WM_3 which already used this mechanism.
+`train_surrogate.py` is parametrized by `--category` and `--arch` (`cnn_a`, `cnn_b`, `cnn_c` — three structurally different architectures) and is used for every group with no validated hand-crafted signal (WM_2, WM_7, WM_8), plus WM_3 which already used this mechanism.
 
-Train the primary ensemble (`cnn_a`, the one `forge_pgd.py` actually attacks):
+`cnn_a` and `cnn_b` together form the attack ensemble `forge_pgd.py` actually optimizes against (attacking multiple diverse architectures at once transfers to an unseen model far better than attacking one — the standard ensemble-transferability trick). `cnn_c` is then a third, still-independent architecture used only by the transfer check in the next step, never part of the attack itself.
 
-```bash
-python train_surrogate.py \
-    --dataset /home/atml_team052/tml-task4-watermark_forging/dataset \
-    --category WM_2 \
-    --arch cnn_a \
-    --output-dir /home/atml_team052/tml-task4-watermark_forging/surrogates \
-    --ensemble-size 5 \
-    --epochs 40
-```
-
-Also train an independent holdout ensemble (`cnn_b`, used only for the transfer sanity check in the next step, never attacked directly):
+Train all three for each surrogate-driven category:
 
 ```bash
-python train_surrogate.py \
-    --dataset /home/atml_team052/tml-task4-watermark_forging/dataset \
-    --category WM_2 \
-    --arch cnn_b \
-    --output-dir /home/atml_team052/tml-task4-watermark_forging/surrogates \
-    --ensemble-size 5 \
-    --epochs 40
+for ARCH in cnn_a cnn_b cnn_c; do
+  python train_surrogate.py \
+      --dataset /home/atml_team052/tml-task4-watermark_forging/dataset \
+      --category WM_2 \
+      --arch "$ARCH" \
+      --output-dir /home/atml_team052/tml-task4-watermark_forging/surrogates \
+      --ensemble-size 5 \
+      --epochs 40
+done
 ```
 
-Repeat both for `--category WM_3`, `WM_7`, `WM_8`. Outputs land in per-category, per-architecture subfolders:
+Repeat for `--category WM_3`, `WM_7`, `WM_8`. Outputs land in per-category, per-architecture subfolders:
 
 ```text
 surrogates/
 ├── wm_2/
 │   ├── cnn_a/{detector_0.pt ... detector_4.pt, metadata.json}
-│   └── cnn_b/{detector_0.pt ... detector_4.pt, metadata.json}
+│   ├── cnn_b/{detector_0.pt ... detector_4.pt, metadata.json}
+│   └── cnn_c/{detector_0.pt ... detector_4.pt, metadata.json}
 ├── wm_3/
 ├── wm_7/
 └── wm_8/
@@ -265,30 +261,36 @@ Each detector uses a different random seed and train/validation split.
 
 ## 10. Check whether the attack is likely to transfer, before spending a submission on it
 
-`check_surrogate_transfer.py` crafts PGD perturbations against the `cnn_a` ensemble and measures whether the independent `cnn_b` ensemble (never used in the attack) also flips its prediction on the same images:
+`check_surrogate_transfer.py` crafts PGD perturbations against the `cnn_a`+`cnn_b` ensemble (`--attack-archs`, comma-separated) and measures whether the independent `cnn_c` ensemble (`--holdout-arch`, never used in the attack) also raises its "watermarked" probability on the same images:
 
 ```bash
 python check_surrogate_transfer.py \
     --dataset /home/atml_team052/tml-task4-watermark_forging/dataset \
     --category WM_2 \
-    --attack-models /home/atml_team052/tml-task4-watermark_forging/surrogates --attack-arch cnn_a \
-    --holdout-models /home/atml_team052/tml-task4-watermark_forging/surrogates --holdout-arch cnn_b \
+    --attack-models /home/atml_team052/tml-task4-watermark_forging/surrogates --attack-archs cnn_a,cnn_b \
+    --holdout-models /home/atml_team052/tml-task4-watermark_forging/surrogates --holdout-arch cnn_c \
     --eps 0.0078431373 \
     --output /home/atml_team052/tml-task4-watermark_forging/transfer_check_wm2.json
 ```
 
-If the two surrogates disagree (low `transfer_ratio` / `holdout_flip_rate`, `"verdict": "unlikely to transfer"`), the attack is very likely overfitting to whatever `cnn_a` happened to learn — for WM_2/7/8 specifically, the validated diagnostics show no significant first-order signal at all, so this is the expected failure mode unless the surrogate is trained with enough augmentation/regularization to avoid memorizing the 25 source images. Treat a "transfer unlikely" verdict as a signal to improve the surrogate (more augmentation, larger negative set, ensemble diversity) before submitting, not as a reason to submit anyway.
+The script reports, and acts on, more than a single AUC-style number:
+
+- **`holdout_genuine_flip_rate`** only counts images where the holdout model's probability actually *crossed* 0.5 because of the attack (`clean < 0.5` → `forged >= 0.5`). A naive "landed above 0.5" count is misleading whenever the holdout model is already miscalibrated and predicts >0.5 on many *clean* images before any attack at all — this was observed in practice for one category, where 88% of "flips" turned out to already be above 0.5 pre-attack.
+- **`holdout_baseline_std`** flags a holdout model that collapsed to a near-constant output regardless of input (e.g. always predicting ≈0.35) — such a holdout can't judge transfer either way, and is reported as `"inconclusive"` rather than a false `"doesn't transfer"`.
+- **`transfer_ratio`** (`holdout_lift / attack_lift`) and the verdict string distinguish three outcomes: `"likely to transfer"`, `"weak or partial transfer"` (some real signal carries over but not enough to cross the holdout's decision boundary at this eps/step budget — worth a bigger budget or a better surrogate, not a flat no), and `"unlikely to transfer"` (no real signal, matches a holdout near chance or collapsed).
+
+Treat anything other than `"likely to transfer"` as a signal to improve the surrogate (more augmentation, larger negative set, bigger eps/step budget) before submitting, not as a reason to submit anyway. `select_routing.py` (step 13) automates exactly this decision.
 
 ## 11. Generate PGD candidates
 
-`forge_pgd.py` is parametrized the same way (`--category`, `--arch`, defaulting to `cnn_a`) and only perturbs the target-image range belonging to `--category` (per `CATEGORY_RANGES` in `common.py`). The quality term in the PGD loss optimizes real LPIPS directly — matching `Sqlt = exp(-8*LPIPS)` exactly — falling back to an MSE+TV proxy with a printed warning if the `lpips` package isn't installed:
+`forge_pgd.py` is parametrized the same way (`--category`, `--archs`, defaulting to `cnn_a`) and only perturbs the target-image range belonging to `--category` (per `CATEGORY_RANGES` in `common.py`). `--archs` accepts a comma-separated list to attack several architectures simultaneously, matching whatever was used in the transfer check. The quality term in the PGD loss optimizes real LPIPS directly — matching `Sqlt = exp(-8*LPIPS)` exactly — falling back to an MSE+TV proxy with a printed warning if the `lpips` package isn't installed:
 
 ```bash
 python forge_pgd.py \
     --dataset /home/atml_team052/tml-task4-watermark_forging/dataset \
     --category WM_2 \
     --models /home/atml_team052/tml-task4-watermark_forging/surrogates \
-    --arch cnn_a \
+    --archs cnn_a,cnn_b \
     --output-dir /home/atml_team052/tml-task4-watermark_forging/pgd_candidates \
     --eps-grid 0.0039215686,0.0078431373,0.011764706 \
     --steps 50 \
@@ -306,7 +308,7 @@ Repeat for `WM_3`, `WM_7`, `WM_8`. The epsilon values correspond to:
 
 Start with the smallest epsilon that improves held-out surrogate AUC.
 
-`train_wm3_surrogate.py` / `forge_wm3_pgd.py` remain as deprecated thin wrappers around `train_surrogate.py --category WM_3` / `forge_pgd.py --category WM_3` for backward compatibility (they only train/attack `cnn_a`).
+`train_wm3_surrogate.py` / `forge_wm3_pgd.py` remain as deprecated thin wrappers around `train_surrogate.py --category WM_3` / `forge_pgd.py --category WM_3` for backward compatibility (they only train/attack the single default `cnn_a` architecture).
 
 ## 12. Inspect candidate quality
 
@@ -331,22 +333,20 @@ Reject candidates that:
 
 ## 13. Build the final submission
 
-`build_submission.py` now takes a generic per-category routing file instead of fixed flags. Write a JSON file mapping each category to the candidate directory you want to use for it, e.g. `routing.json`:
+`build_submission.py` takes a generic per-category routing file instead of fixed flags: a JSON mapping each category to the candidate directory to use for it. Any category omitted from the file (or whose file is missing for a given id) falls back to the unmodified clean target.
 
-```json
-{
-  "WM_1": "/home/atml_team052/tml-task4-watermark_forging/specialized_candidates/strength_0.005",
-  "WM_2": "/home/atml_team052/tml-task4-watermark_forging/pgd_candidates/wm_2/eps_0.007843",
-  "WM_3": "/home/atml_team052/tml-task4-watermark_forging/pgd_candidates/wm_3/eps_0.007843",
-  "WM_4": "/home/atml_team052/tml-task4-watermark_forging/specialized_candidates/strength_0.005",
-  "WM_5": "/home/atml_team052/tml-task4-watermark_forging/specialized_candidates/strength_0.005",
-  "WM_6": "/home/atml_team052/tml-task4-watermark_forging/specialized_candidates/strength_0.005",
-  "WM_7": "/home/atml_team052/tml-task4-watermark_forging/pgd_candidates/wm_7/eps_0.007843",
-  "WM_8": "/home/atml_team052/tml-task4-watermark_forging/pgd_candidates/wm_8/eps_0.007843"
-}
+Rather than writing `routing.json` by hand, `select_routing.py` builds it automatically: WM_1/4/5/6 always route to the specialized candidates (they don't depend on a black-box surrogate at all), and each surrogate-driven category (WM_2/3/7/8) routes to its PGD candidate **only if** its `transfer_check_<category>.json` verdict (step 10) says `"likely to transfer"` — otherwise it falls back to the mean-residual baseline automatically, with no manual editing required:
+
+```bash
+python select_routing.py \
+    --specialized-dir /home/atml_team052/tml-task4-watermark_forging/specialized_candidates --specialized-strength 0.005 \
+    --baseline-dir /home/atml_team052/tml-task4-watermark_forging/baseline_candidates --baseline-strength 0.02 \
+    --pgd-dir /home/atml_team052/tml-task4-watermark_forging/pgd_candidates --pgd-eps 0.007843 \
+    --transfer-checks-dir /home/atml_team052/tml-task4-watermark_forging \
+    --output /home/atml_team052/tml-task4-watermark_forging/routing.json
 ```
 
-Any category omitted from the file (or whose file is missing for a given id) falls back to the unmodified clean target.
+It prints its reasoning per category (`transfer check passed`, `transfer check failed (...)`, or `no transfer check found`) so you can see exactly why each category landed where it did. Inspect the printed output and the resulting `routing.json` before treating it as final — a `"weak or partial transfer"` verdict currently also falls back to the baseline, even though step 10 suggests that case deserves more investment (bigger eps/step budget, a better surrogate) rather than an automatic fallback; edit `routing.json` by hand afterwards if you've separately validated a stronger candidate for such a category.
 
 ```bash
 python build_submission.py \
@@ -451,13 +451,14 @@ Relative output paths should be avoided because Condor executes jobs in temporar
 3. Review specificity and provenance controls
 4. Generate the mean-residual baseline for all categories
 5. Generate specialized candidates (WM_1, WM_4, WM_5, WM_6)
-6. Train surrogate ensembles (cnn_a and cnn_b) for WM_2, WM_3, WM_7, WM_8
-7. Run the cross-surrogate transfer sanity check for WM_2, WM_3, WM_7, WM_8
-8. Generate PGD candidates for WM_2, WM_3, WM_7, WM_8
+6. Train surrogate ensembles (cnn_a, cnn_b, cnn_c) for WM_2, WM_3, WM_7, WM_8
+7. Run the cross-surrogate transfer sanity check (cnn_a+cnn_b attack vs cnn_c holdout)
+8. Generate PGD candidates (cnn_a+cnn_b ensemble attack) for WM_2, WM_3, WM_7, WM_8
 9. Inspect image quality
 10. Run category ablations against the baseline
-11. Select the best attack per category
-12. Write routing.json and build the final submission ZIP
+11. Run select_routing.py to auto-route each category based on the transfer-check verdicts
+12. Manually review and adjust routing.json for any "weak or partial transfer" categories
+13. Build the final submission ZIP
 ```
 
 ## 17. Limitations

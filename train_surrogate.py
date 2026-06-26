@@ -4,10 +4,14 @@ watermark category. Used as the surrogate detector that forge_pgd.py attacks
 with constrained PGD for categories with no validated hand-crafted signal
 (WM_2, WM_3, WM_7, WM_8).
 
-Two distinct architectures (--arch cnn_a / cnn_b) are provided so that an
-independent, structurally different ensemble can be trained for the same
-category and used purely to sanity-check transfer (see
-check_surrogate_transfer.py) before spending a real submission on it.
+Three distinct architectures (--arch cnn_a / cnn_b / cnn_c) are provided.
+cnn_a is the default single-architecture attack target for forge_pgd.py.
+forge_pgd.py can also attack cnn_a and cnn_b *together* as an ensemble (the
+standard transferability trick: optimizing against diverse models at once
+generalizes better to a third, unseen model than optimizing against one).
+cnn_c is then available as a truly independent holdout for
+check_surrogate_transfer.py to judge that ensemble attack against, since
+cnn_a/cnn_b are no longer independent of the attack once both are used.
 """
 from __future__ import annotations
 
@@ -92,7 +96,33 @@ class ResidualCNNAlt(nn.Module):
         return self.net(x).squeeze(1)
 
 
-ARCHITECTURES = {"cnn_a": ResidualCNN, "cnn_b": ResidualCNNAlt}
+class ResidualCNNWide(nn.Module):
+    """Third architecture: shallow and wide, GroupNorm instead of BatchNorm,
+    a single downsample. Used as a third source of architectural diversity --
+    either as the independent holdout for an ensemble (cnn_a+cnn_b) attack,
+    or as a third member if the attack ensemble is widened further."""
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 64, 3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(128, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(1)
+
+
+ARCHITECTURES = {"cnn_a": ResidualCNN, "cnn_b": ResidualCNNAlt, "cnn_c": ResidualCNNWide}
 
 
 def build_model(arch):
