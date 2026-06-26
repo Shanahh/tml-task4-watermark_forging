@@ -189,24 +189,16 @@ Routing should be revised only when the validated diagnostics provide stronger e
 
 ## 7. Generate specialized non-neural candidates
 
-Run:
+Strength is **per-category**, not a single shared value: each category has very different LPIPS sensitivity per unit strength (see step 8), so a single shared strength necessarily over- or under-drives at least one category. Run with the defaults (the knee points found by the sweep in step 8) or override per category:
 
 ```bash
 python forge_specialized.py \
     --dataset /home/atml_team052/tml-task4-watermark_forging/dataset \
     --output-dir /home/atml_team052/tml-task4-watermark_forging/specialized_candidates \
-    --strength-grid 0.0025,0.005,0.01,0.02
+    --wm1-strength 0.03 --wm3-strength 0.015 --wm4-strength 0.01 --wm5-strength 0.07 --wm6-strength 0.04
 ```
 
-This produces one complete 200-image candidate folder per strength:
-
-```text
-specialized_candidates/
-├── strength_0.0025/
-├── strength_0.005/
-├── strength_0.01/
-└── strength_0.02/
-```
+This produces a single complete 200-image candidate folder (no more `strength_<value>` subfolders — there's only one combination per invocation now). To compare different strength choices, run it multiple times with different `--output-dir` values.
 
 The script modifies:
 
@@ -241,7 +233,17 @@ The conservative strength grid above (`0.0025`–`0.02`) was never validated aga
     --strength-grid 0.0025,0.005,0.01,0.02,0.05,0.1,0.2,0.3,0.4,0.5
 ```
 
-Example output for WM_1: `strength=0.005 → Sqlt=0.99` (almost no cost paid, almost no detection strength bought either), `strength=0.02 → Sqlt=0.81` (where the old grid topped out), `strength=0.1 → Sqlt=0.097` (already collapsed). The real usable ceiling sits somewhere between `0.02` and `0.1`, never explored by the old default — re-run `forge_specialized.py` with a `--strength-grid` that brackets the knee you find here, then pass the chosen value to `run_pipeline.sh --specialized-strength` (see step 13).
+Measured knee points per category (your own re-run may differ slightly if the templates change):
+
+| Category | Channel(s) perturbed | LPIPS sensitivity | Knee (`Sqlt` drops sharply past here) | Default used |
+|---|---|---|---|---|
+| WM_4 | Y (luma) | highest | ~0.01 (`Sqlt=0.75`) → 0.02 already costs 63% | `0.01` |
+| WM_3 | Y+Cb+Cr | high | ~0.01–0.02 (`Sqlt=0.77→0.41`) | `0.015` |
+| WM_1 | Cb only | moderate | ~0.02–0.05 (`Sqlt=0.81→0.35`) | `0.03` |
+| WM_5 | Cb/Cr residual + LSB | low | ~0.05–0.1 (`Sqlt=0.71→0.32`) | `0.07` |
+| WM_6 | DCT (Y) | none past saturation | **saturates exactly at `strength≥0.04`** (its interpolation factor is `min(1, strength*25)`) — every value above that gives identical output, so there's no real tradeoff, just no reason to use less | `0.04` |
+
+These are now `forge_specialized.py`'s own defaults and `run_pipeline.sh`'s defaults (step 17) — pass `--wm1-strength`/`--wm3-strength`/etc. to either to override them if a re-run of the sweep finds different knees.
 
 ## 9. Generate the generic mean-residual baseline
 
@@ -312,7 +314,7 @@ The script reports, and acts on, more than a single AUC-style number:
 - **`holdout_baseline_std`** flags a holdout model that collapsed to a near-constant output regardless of input (e.g. always predicting ≈0.35) — such a holdout can't judge transfer either way, and is reported as `"inconclusive"` rather than a false `"doesn't transfer"`.
 - **`transfer_ratio`** (`holdout_lift / attack_lift`) and the verdict string distinguish three outcomes: `"likely to transfer"`, `"weak or partial transfer"` (some real signal carries over but not enough to cross the holdout's decision boundary at this eps/step budget — worth a bigger budget or a better surrogate, not a flat no), and `"unlikely to transfer"` (no real signal, matches a holdout near chance or collapsed).
 
-Treat anything other than `"likely to transfer"` as a signal to improve the surrogate (more augmentation, larger negative set, bigger eps/step budget) before submitting, not as a reason to submit anyway. `select_routing.py` (step 13) automates exactly this decision.
+Treat anything other than `"likely to transfer"` as a signal to improve the surrogate (more augmentation, larger negative set, bigger eps/step budget) before submitting, not as a reason to submit anyway. `select_routing.py` (step 14) automates exactly this decision.
 
 ## 12. Generate PGD candidates
 
@@ -348,7 +350,7 @@ Start with the smallest epsilon that improves held-out surrogate AUC.
 ```bash
 python inspect_outputs.py \
     --clean-dir /home/atml_team052/tml-task4-watermark_forging/dataset/clean_targets \
-    --forged-dir /home/atml_team052/tml-task4-watermark_forging/specialized_candidates/strength_0.005
+    --forged-dir /home/atml_team052/tml-task4-watermark_forging/specialized_candidates
 ```
 
 ```bash
@@ -368,20 +370,20 @@ Reject candidates that:
 
 `build_submission.py` takes a generic per-category routing file instead of fixed flags: a JSON mapping each category to the candidate directory to use for it. Any category omitted from the file (or whose file is missing for a given id) falls back to the unmodified clean target.
 
-Rather than writing `routing.json` by hand, `select_routing.py` builds it automatically: WM_1/4/5/6 always route to the specialized candidates (they don't depend on a black-box surrogate at all), and each surrogate-driven category (WM_2/3/7/8) routes to its PGD candidate **only if** its `transfer_check_<category>.json` verdict (step 10) says `"likely to transfer"` — otherwise it falls back to the mean-residual baseline automatically, with no manual editing required:
+Rather than writing `routing.json` by hand, `select_routing.py` builds it automatically: WM_1/3/4/5/6 always route to the specialized candidates (they don't depend on a black-box surrogate at all), and each surrogate-driven category (WM_2/7/8) routes to its PGD candidate **only if** its `transfer_check_<category>.json` verdict (step 11) says `"likely to transfer"` — otherwise it falls back to the mean-residual baseline automatically, with no manual editing required:
 
 ```bash
 python select_routing.py \
-    --specialized-dir /home/atml_team052/tml-task4-watermark_forging/specialized_candidates --specialized-strength 0.04 \
+    --specialized-dir /home/atml_team052/tml-task4-watermark_forging/specialized_candidates \
     --baseline-dir /home/atml_team052/tml-task4-watermark_forging/baseline_candidates --baseline-strength 0.02 \
     --pgd-dir /home/atml_team052/tml-task4-watermark_forging/pgd_candidates --pgd-eps 0.007843 \
     --transfer-checks-dir /home/atml_team052/tml-task4-watermark_forging \
     --output /home/atml_team052/tml-task4-watermark_forging/routing.json
 ```
 
-`--specialized-strength` here should be whatever step 8's LPIPS sweep showed was the real usable ceiling (`0.04` above is illustrative, not a recommendation) — not the conservative default. `run_pipeline.sh --specialized-strength <value>` (step 17) passes this through automatically and validates the corresponding `specialized_candidates/strength_<value>/` folder actually exists before building the submission, rather than silently falling back to clean images if it doesn't.
+`--specialized-dir` points directly at `forge_specialized.py`'s output (no `strength_<value>` subfolder anymore, since strength is per-category now — see step 7). `run_pipeline.sh --wm1-strength <value> --wm3-strength <value> ...` (step 17) passes the per-category strengths through to `forge_specialized.py` automatically.
 
-It prints its reasoning per category (`transfer check passed`, `transfer check failed (...)`, or `no transfer check found`) so you can see exactly why each category landed where it did. Inspect the printed output and the resulting `routing.json` before treating it as final — a `"weak or partial transfer"` verdict currently also falls back to the baseline, even though step 10 suggests that case deserves more investment (bigger eps/step budget, a better surrogate) rather than an automatic fallback; edit `routing.json` by hand afterwards if you've separately validated a stronger candidate for such a category.
+It prints its reasoning per category (`transfer check passed`, `transfer check failed (...)`, or `no transfer check found`) so you can see exactly why each category landed where it did. Inspect the printed output and the resulting `routing.json` before treating it as final — a `"weak or partial transfer"` verdict currently also falls back to the baseline, even though step 11 suggests that case deserves more investment (bigger eps/step budget, a better surrogate) rather than an automatic fallback; edit `routing.json` by hand afterwards if you've separately validated a stronger candidate for such a category.
 
 ```bash
 python build_submission.py \
@@ -417,18 +419,11 @@ Only combine attacks that produce measurable improvements over the mean-residual
 
 Recommended initial sweeps:
 
-### WM_1, WM_3, WM_4 (continuous-strength specialized attacks)
+### WM_1, WM_3, WM_4, WM_5 (continuous-strength specialized attacks)
 
-```text
-0.0025
-0.005
-0.01
-0.02
-```
+Use `run_lpips_sweep.sh` (step 6) to find each category's own knee point directly from real LPIPS, rather than picking one shared grid for all of them — they have very different sensitivity (WM_4's luma attack drops sharply by `0.02`; WM_1's chroma attack doesn't until ~`0.05`). Bracket the knee with a few values around it, e.g. for WM_1: `0.01, 0.02, 0.03, 0.04, 0.05`.
 
-### WM_5
-
-The residual half uses the same strength grid as WM_1/WM_3/WM_4. The LSB half has no strength knob — it is a binary bit-plane copy applied at full strength regardless. Worth ablating the two halves independently (residual only, LSB only, both) in case one of them doesn't correspond to what the real detector reads.
+For WM_5 specifically: the residual half follows the sweep above. The LSB half has no strength knob — it is a binary bit-plane copy applied at full strength regardless. Worth ablating the two halves independently (residual only, LSB only, both) in case one of them doesn't correspond to what the real detector reads.
 
 ### WM_2, WM_7, WM_8 (surrogate+PGD; WM_3 too, for ablation comparison only)
 
@@ -440,7 +435,7 @@ The residual half uses the same strength grid as WM_1/WM_3/WM_4. The LSB half ha
 
 ### WM_6
 
-Reduce the DCT interpolation strength if block artifacts or visible changes appear.
+No need to sweep — `run_lpips_sweep.sh` showed this attack saturates exactly at `strength=0.04` (`apply_dct`'s interpolation factor caps at `1.0` there) with almost no perceptual cost (`Sqlt=0.98`). Use `0.04` (or anything above it — identical effect) unless block artifacts appear, in which case reduce `--wm6-coeff-count` instead of strength.
 
 ### All categories (baseline)
 
@@ -485,18 +480,17 @@ Relative output paths should be avoided because Condor executes jobs in temporar
 2. Run validated diagnostics
 3. Review specificity and provenance controls
 4. Generate the mean-residual baseline for all categories
-5. Generate specialized candidates (WM_1, WM_3, WM_4, WM_5, WM_6) at a wide, exploratory strength grid
-6. Run check_lsb_roundtrip.py to verify the WM_5 LSB attack survives a real PNG save/reload
-7. Run run_lpips_sweep.sh to find the real usable strength ceiling per category, instead of guessing
-8. Re-generate specialized candidates bracketing the strength each sweep found
-9. Train surrogate ensembles (cnn_a, cnn_b, cnn_c) for WM_2, WM_3, WM_7, WM_8
-10. Run the cross-surrogate transfer sanity check (cnn_a+cnn_b attack vs cnn_c holdout)
-11. Generate PGD candidates (cnn_a+cnn_b ensemble attack) for WM_2, WM_3, WM_7, WM_8
-12. Inspect image quality
-13. Run category ablations against the baseline
-14. Run select_routing.py (or run_pipeline.sh --specialized-strength <value>) to auto-route each category
-15. Manually review and adjust routing.json for any "weak or partial transfer" categories
-16. Build the final submission ZIP
+5. Run check_lsb_roundtrip.py to verify the WM_5 LSB attack survives a real PNG save/reload
+6. Run run_lpips_sweep.sh to find the real usable per-category strength ceiling, instead of guessing
+7. Generate specialized candidates (WM_1, WM_3, WM_4, WM_5, WM_6) at the per-category strengths the sweep found
+8. Train surrogate ensembles (cnn_a, cnn_b, cnn_c) for WM_2, WM_3, WM_7, WM_8
+9. Run the cross-surrogate transfer sanity check (cnn_a+cnn_b attack vs cnn_c holdout)
+10. Generate PGD candidates (cnn_a+cnn_b ensemble attack) for WM_2, WM_3, WM_7, WM_8
+11. Inspect image quality
+12. Run category ablations against the baseline
+13. Run select_routing.py (or run_pipeline.sh --wm1-strength <value> --wm3-strength <value> ...) to auto-route each category
+14. Manually review and adjust routing.json for any "weak or partial transfer" categories
+15. Build the final submission ZIP
 ```
 
 ## 18. Limitations

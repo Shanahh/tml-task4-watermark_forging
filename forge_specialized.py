@@ -22,6 +22,20 @@ black-box proxy model's transferability to the real detector.
 WM_2, WM_7, WM_8 are left untouched here; they are handled by the
 surrogate-classifier + PGD pipeline only, since they show no validated
 hand-crafted signal at all.
+
+Strength is per-category (--wm1-strength, --wm3-strength, ...), not a single
+shared value: sweep_lpips_strength.py / run_lpips_sweep.sh showed these
+categories have very different LPIPS sensitivity per unit strength --
+WM_4 (luma) drops sharply by strength=0.02 (Sqlt=0.37), while WM_6's DCT
+attack saturates at strength>=0.04 (its interpolation factor caps at 1.0)
+and costs almost nothing (Sqlt=0.98) even there. A single shared strength
+necessarily over- or under-drives at least one category. The defaults below
+were chosen from that sweep's knee points; re-run the sweep and override
+them if the underlying templates change.
+
+This script produces exactly one candidate set per invocation now (no more
+strength_<value> subfolders) -- if you want to compare strength choices,
+run it multiple times with different --output-dir values.
 """
 from __future__ import annotations
 
@@ -39,7 +53,14 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, default=Path("specialized_candidates"))
-    p.add_argument("--strength-grid", default="0.0025,0.005,0.01,0.02")
+    # Defaults are the knee points found by sweep_lpips_strength.py: roughly
+    # where Sqlt starts dropping sharply for that category's perturbed
+    # channel(s). See module docstring.
+    p.add_argument("--wm1-strength", type=float, default=0.03)
+    p.add_argument("--wm3-strength", type=float, default=0.015)
+    p.add_argument("--wm4-strength", type=float, default=0.01)
+    p.add_argument("--wm5-strength", type=float, default=0.07)
+    p.add_argument("--wm6-strength", type=float, default=0.04)
     p.add_argument("--wm4-threshold", type=float, default=0.45)
     p.add_argument("--wm6-coeff-count", type=int, default=8)
     return p.parse_args()
@@ -285,31 +306,33 @@ def main():
     wm6_clean_stats = dct_block_stats(by_resolution[wm6_resolution])
     wm6_coords = select_dct_coords(wm6_stats, wm6_clean_stats, args.wm6_coeff_count)
     print("WM6 DCT coeffs", wm6_coords)
+    print(
+        f"strengths: WM_1={args.wm1_strength} WM_3={args.wm3_strength} "
+        f"WM_4={args.wm4_strength} WM_5={args.wm5_strength} WM_6={args.wm6_strength}"
+    )
 
-    for strength in [float(v) for v in args.strength_grid.split(",")]:
-        out_dir = args.output_dir / f"strength_{strength:g}"
-        out_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
-        for i, x in clean.items():
-            if 1 <= i <= 25:
-                y = apply_channel(x, wm1_cb_template, 1, strength)
-            elif 51 <= i <= 75:
-                y = x
-                for ch in WM3_CHANNELS:
-                    y = apply_channel(y, wm3_channel_templates[ch], ch, strength)
-            elif 76 <= i <= 100:
-                y = apply_luma(x, wm4_phase_template, strength)
-            elif 101 <= i <= 125:
-                y = apply_channel(x, wm5_cb_template, 1, strength)
-                y = apply_channel(y, wm5_cr_template, 2, strength)
-                y = apply_lsb_pair(y, wm5_cb_lsb, wm5_cr_lsb)
-            elif 126 <= i <= 150:
-                y = apply_dct(x, wm6_coords, wm6_stats, wm6_clean_stats, min(1, strength * 25))
-            else:
-                y = x
-            save_rgb(y, out_dir / f"{i}.png")
+    for i, x in clean.items():
+        if 1 <= i <= 25:
+            y = apply_channel(x, wm1_cb_template, 1, args.wm1_strength)
+        elif 51 <= i <= 75:
+            y = x
+            for ch in WM3_CHANNELS:
+                y = apply_channel(y, wm3_channel_templates[ch], ch, args.wm3_strength)
+        elif 76 <= i <= 100:
+            y = apply_luma(x, wm4_phase_template, args.wm4_strength)
+        elif 101 <= i <= 125:
+            y = apply_channel(x, wm5_cb_template, 1, args.wm5_strength)
+            y = apply_channel(y, wm5_cr_template, 2, args.wm5_strength)
+            y = apply_lsb_pair(y, wm5_cb_lsb, wm5_cr_lsb)
+        elif 126 <= i <= 150:
+            y = apply_dct(x, wm6_coords, wm6_stats, wm6_clean_stats, min(1, args.wm6_strength * 25))
+        else:
+            y = x
+        save_rgb(y, args.output_dir / f"{i}.png")
 
-        print("saved", out_dir)
+    print("saved", args.output_dir)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ def parse_args():
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--scratch-dir", type=Path, default=Path("lsb_roundtrip_scratch"))
     p.add_argument("--n-images", type=int, default=25, help="how many WM_5 targets to check (max 25)")
+    p.add_argument("--wm5-strength", type=float, default=0.07, help="must match forge_specialized.py's --wm5-strength")
     return p.parse_args()
 
 
@@ -63,8 +64,8 @@ def main():
         cb_mismatches.append(check_channel(x, cb_template, 1, args.scratch_dir / f"{i}_cb.png"))
         cr_mismatches.append(check_channel(x, cr_template, 2, args.scratch_dir / f"{i}_cr.png"))
 
-        combined = apply_channel(x, cb_residual, 1, 0.005)
-        combined = apply_channel(combined, cr_residual, 2, 0.005)
+        combined = apply_channel(x, cb_residual, 1, args.wm5_strength)
+        combined = apply_channel(combined, cr_residual, 2, args.wm5_strength)
         combined = apply_lsb_pair(combined, cb_template, cr_template)
         save_rgb(combined, args.scratch_dir / f"{i}_combined.png")
         reloaded = load_rgb(args.scratch_dir / f"{i}_combined.png")

@@ -26,8 +26,13 @@ DEFAULT_SURROGATE_CATEGORIES = ["WM_2", "WM_7", "WM_8"]
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--specialized-dir", type=Path, required=True)
-    p.add_argument("--specialized-strength", default="0.005")
+    p.add_argument(
+        "--specialized-dir",
+        type=Path,
+        required=True,
+        help="directory containing forge_specialized.py's output directly (no strength_<value> "
+        "subfolder -- each category there is already at its own chosen per-category strength)",
+    )
     p.add_argument("--baseline-dir", type=Path, required=True)
     p.add_argument("--baseline-strength", default="0.02")
     p.add_argument("--pgd-dir", type=Path, required=True)
@@ -51,7 +56,7 @@ def main():
     specialized_categories = [c.strip() for c in args.specialized_categories.split(",") if c.strip()]
     surrogate_categories = [c.strip() for c in args.surrogate_categories.split(",") if c.strip()]
 
-    specialized_path = args.specialized_dir / f"strength_{args.specialized_strength}"
+    specialized_path = args.specialized_dir
     baseline_path = args.baseline_dir / f"strength_{args.baseline_strength}"
 
     routing = {}

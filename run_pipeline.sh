@@ -2,19 +2,17 @@
 set -eo pipefail
 
 # Usage:
-#   ./run_pipeline.sh [--specialized-strength 0.04] [--strength-grid 0.0025,0.005,0.01,0.02,0.04,0.08]
+#   ./run_pipeline.sh [--wm1-strength 0.03] [--wm3-strength 0.015] \
+#                      [--wm4-strength 0.01] [--wm5-strength 0.07] [--wm6-strength 0.04]
 #
-# --specialized-strength is the value actually used for the final submission
-# routing (passed to select_routing.py). It MUST also appear in
-# --strength-grid (forge_specialized.py needs to have generated a candidate
-# folder at that exact strength) -- the script checks this and fails fast
-# with a clear error otherwise, rather than silently falling back to clean
-# images at build_submission time.
-#
-# Run ./run_lpips_sweep.sh first to find a real, LPIPS-validated strength
-# instead of guessing -- the previous default (0.005) left almost all of the
-# perceptual quality budget unused (Sqlt=0.99 at that strength for WM_1),
-# which is the likely dominant reason for a capped score.
+# Strength is per-category, not a single shared value: run_lpips_sweep.sh
+# showed these categories have very different LPIPS sensitivity per unit
+# strength (e.g. WM_4's luma attack drops sharply by 0.02, while WM_6's DCT
+# attack saturates at >=0.04 at almost no perceptual cost). A single shared
+# strength necessarily over- or under-drives at least one category. The
+# defaults below are forge_specialized.py's own defaults (the knee points
+# found by the sweep) -- run ./run_lpips_sweep.sh first and override these if
+# the underlying templates change.
 
 PROJECT=/home/atml_team052/tml-task4-watermark_forging
 ENV=/home/atml_team052/.conda/envs/tmltask4
@@ -24,13 +22,19 @@ export PYTHONNOUSERSITE=1
 export HF_HOME=/home/atml_team052/.cache/huggingface
 export PIP_CACHE_DIR=/home/atml_team052/.cache/pip
 
-SPECIALIZED_STRENGTH="0.005"
-STRENGTH_GRID="0.0025,0.005,0.01,0.02"
+WM1_STRENGTH="0.03"
+WM3_STRENGTH="0.015"
+WM4_STRENGTH="0.01"
+WM5_STRENGTH="0.07"
+WM6_STRENGTH="0.04"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --specialized-strength) SPECIALIZED_STRENGTH="$2"; shift 2 ;;
-        --strength-grid) STRENGTH_GRID="$2"; shift 2 ;;
+        --wm1-strength) WM1_STRENGTH="$2"; shift 2 ;;
+        --wm3-strength) WM3_STRENGTH="$2"; shift 2 ;;
+        --wm4-strength) WM4_STRENGTH="$2"; shift 2 ;;
+        --wm5-strength) WM5_STRENGTH="$2"; shift 2 ;;
+        --wm6-strength) WM6_STRENGTH="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -120,11 +124,15 @@ echo "=== [2/6] Baseline (all categories) ==="
 #    model's transferability to the real detector.
 # ---------------------------------------------------------------------------
 echo "=== [3/6] Specialized candidates (WM_1, WM_3, WM_4, WM_5, WM_6) ==="
-echo "strength grid: $STRENGTH_GRID (routing will use strength=$SPECIALIZED_STRENGTH)"
+echo "strengths: WM_1=$WM1_STRENGTH WM_3=$WM3_STRENGTH WM_4=$WM4_STRENGTH WM_5=$WM5_STRENGTH WM_6=$WM6_STRENGTH"
 "$PYTHON" "$PROJECT/forge_specialized.py" \
     --dataset "$DATASET" \
     --output-dir "$PROJECT/specialized_candidates" \
-    --strength-grid "$STRENGTH_GRID"
+    --wm1-strength "$WM1_STRENGTH" \
+    --wm3-strength "$WM3_STRENGTH" \
+    --wm4-strength "$WM4_STRENGTH" \
+    --wm5-strength "$WM5_STRENGTH" \
+    --wm6-strength "$WM6_STRENGTH"
 
 # ---------------------------------------------------------------------------
 # 5. Surrogate-classifier ensembles for categories with no validated
@@ -198,29 +206,16 @@ done
 #    surrogate category whose attack did not come back "likely to transfer" --
 #    this is the actual decision logic, not a manual edit. WM_1/3/4/5/6 (the
 #    validated hand-crafted attacks, including WM_3's by default now) are
-#    always routed to specialized candidates regardless, since they don't
-#    depend on a black-box surrogate. Inspect routing.json afterwards and
-#    re-run category ablations before treating this as final -- the chosen
-#    strength/eps (0.005 / 2-255) are starting points, not necessarily the
-#    best-scoring combination.
+#    always routed straight to specialized_candidates/ (now a single
+#    per-category-strength output, not a strength_<value> subfolder), since
+#    they don't depend on a black-box surrogate. Inspect routing.json
+#    afterwards and re-run category ablations before treating this as final.
 # ---------------------------------------------------------------------------
 echo "=== [7/7] Build submission ==="
 
-# Canonicalize the strength string the same way Python's f"{s:g}" formats it,
-# so this matches the folder name forge_specialized.py actually created
-# (e.g. "0.040" -> "0.04"), and fail fast if that folder doesn't exist
-# instead of build_submission.py silently falling back to clean images.
-SPECIALIZED_STRENGTH_CANON=$("$PYTHON" -c "print(f'{float(\"$SPECIALIZED_STRENGTH\"):g}')")
-SPECIALIZED_STRENGTH_DIR="$PROJECT/specialized_candidates/strength_${SPECIALIZED_STRENGTH_CANON}"
-if [ ! -d "$SPECIALIZED_STRENGTH_DIR" ]; then
-    echo "ERROR: $SPECIALIZED_STRENGTH_DIR does not exist." >&2
-    echo "--specialized-strength ($SPECIALIZED_STRENGTH) must also be included in --strength-grid ($STRENGTH_GRID)." >&2
-    exit 1
-fi
-
 ROUTING="$PROJECT/routing.json"
 "$PYTHON" "$PROJECT/select_routing.py" \
-    --specialized-dir "$PROJECT/specialized_candidates" --specialized-strength "$SPECIALIZED_STRENGTH_CANON" \
+    --specialized-dir "$PROJECT/specialized_candidates" \
     --baseline-dir "$PROJECT/baseline_candidates" --baseline-strength 0.02 \
     --pgd-dir "$PROJECT/pgd_candidates" --pgd-eps 0.007843 \
     --transfer-checks-dir "$PROJECT" \
