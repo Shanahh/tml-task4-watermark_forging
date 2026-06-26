@@ -28,6 +28,7 @@ tml-task4-watermark_forging/
 ├── diagnose_watermarks_validated.py
 ├── forge_specialized.py
 ├── check_lsb_roundtrip.py
+├── calibrate_strength.py
 ├── sweep_lpips_strength.py
 ├── run_lpips_sweep.sh
 ├── forge_baseline.py
@@ -38,6 +39,7 @@ tml-task4-watermark_forging/
 ├── forge_wm3_pgd.py         # deprecated thin wrapper -> forge_pgd.py --category WM_3
 ├── select_routing.py
 ├── build_submission.py
+├── verify_submission.py
 ├── run_pipeline.sh
 │
 ├── diagnostics_validated/
@@ -189,16 +191,18 @@ Routing should be revised only when the validated diagnostics provide stronger e
 
 ## 7. Generate specialized non-neural candidates
 
-Strength is **per-category**, not a single shared value: each category has very different LPIPS sensitivity per unit strength (see step 8), so a single shared strength necessarily over- or under-drives at least one category. Run with the defaults (the knee points found by the sweep in step 8) or override per category:
+Strength is **per-category** (and **per-channel for WM_3**), and the defaults are **amplitude-calibrated** (step 8): they reproduce the genuine watermark's own amplitude, measured from the 25 sources, rather than the largest perturbation the LPIPS budget allows. Run with the defaults or override:
 
 ```bash
 python forge_specialized.py \
     --dataset /home/atml_team052/tml-task4-watermark_forging/dataset \
     --output-dir /home/atml_team052/tml-task4-watermark_forging/specialized_candidates \
-    --wm1-strength 0.03 --wm3-strength 0.015 --wm4-strength 0.01 --wm5-strength 0.07 --wm6-strength 0.04
+    --wm1-strength 0.0024 \
+    --wm3-y-strength 0.0079 --wm3-cb-strength 0.0017 --wm3-cr-strength 0.0017 \
+    --wm4-strength 0.0091 --wm5-strength 0.0071 --wm6-strength 0.04
 ```
 
-This produces a single complete 200-image candidate folder (no more `strength_<value>` subfolders — there's only one combination per invocation now). To compare different strength choices, run it multiple times with different `--output-dir` values.
+This produces a single complete 200-image candidate folder (no `strength_<value>` subfolders — one combination per invocation). To compare strength choices, run it multiple times with different `--output-dir` values.
 
 The script modifies:
 
@@ -224,26 +228,53 @@ python check_lsb_roundtrip.py \
 
 It should report `PASS` with <1% bit mismatch for all three checks (Cb alone, Cr alone, combined). Run this any time `apply_lsb`/`apply_lsb_pair` or the YCbCr conversion code changes — this bug would have silently capped WM_5's score at whatever the (irrelevant) residual half alone contributed, with no error or warning anywhere.
 
-## 8. Find the real usable strength budget before picking one
+## 8. Calibrate strength to the genuine watermark's amplitude (the correct target)
 
-The conservative strength grid above (`0.0025`–`0.02`) was never validated against where LPIPS actually starts climbing — looking visually fine at a given strength is a sign of *unclaimed* detection budget, not evidence the strength is well-chosen, since `Sqlt = exp(-8*LPIPS)` tolerates this kind of small, high-frequency additive perturbation much better than intuition suggests. `run_lpips_sweep.sh` measures real LPIPS across a much wider strength range and prints exactly where the curve bends:
+This is the most important strength step, and it replaces "pick the strength the LPIPS budget allows" with "pick the strength that reproduces the real watermark."
+
+The score is `Sdet · Sqlt`. We can measure `Sqlt` locally (LPIPS, below), but we have **no** local measurement of `Sdet` (the real decoder's bit accuracy). Choosing strength to maximize the perturbation within the LPIPS budget optimizes only the half we can see — and it turned out to be actively wrong. `calibrate_strength.py` closes that gap for the additive categories (WM_1/3/4/5):
+
+```bash
+python calibrate_strength.py \
+    --dataset /home/atml_team052/tml-task4-watermark_forging/dataset
+```
+
+For an additive, content-independent watermark, every source is `clean_content + δ` (same δ). Projecting each source's residual onto the extracted template direction collapses it to a single number — how much watermark is present along its own axis. The 25 sources form a tight cluster (mean `μ_s`, std `σ_s`): **that is the genuine watermark's amplitude.** A forgery `clean + s·δ̂` projects linearly in `s`; the tool solves for the `s*` whose forgery projection equals `μ_s`, and reports where the current strength lands relative to the genuine cluster in units of `σ_s`.
+
+Running this revealed the strengths in use had been massively overshooting — the likely dominant reason the score was capped and then regressed:
+
+| Category·Channel | Genuine `s*` (calibrated) | A prior run used | Overshoot |
+|---|---|---|---|
+| WM_1 Cb | **0.0024** | 0.03 | +16.5σ |
+| WM_3 Y | 0.0079 | 0.015 | +2.9σ |
+| WM_3 Cb | **0.0017** | 0.015 | +26σ |
+| WM_3 Cr | **0.0017** | 0.015 | +15.5σ |
+| WM_5 Cb | **0.0069** | 0.07 | +44.5σ |
+| WM_5 Cr | **0.0073** | 0.07 | +35σ |
+| WM_4 Y-phase | 0.0091 | 0.01 | +0.19σ (already right) |
+
+These `s*` values are now `forge_specialized.py`'s defaults. Two findings baked into the defaults: WM_3's channels have genuinely different amplitudes (Y ≈ 4.6× Cb/Cr), so WM_3 now takes three separate strengths; and WM_4 was the only category already calibrated. Overshooting matters because it pushes the forgery outside the distribution of real watermarked images — which can *lower* the decoder's bit accuracy and also costs Sqlt, a double loss. **Note the limitation:** calibration fixes amplitude, not extraction direction — if the template `δ̂` itself is a poor estimate of the true `δ`, matching its amplitude still won't decode correctly. It's necessary, not guaranteed sufficient.
+
+### Secondary: where does LPIPS quality collapse?
+
+`run_lpips_sweep.sh` measures real LPIPS across a wide strength range — useful as an upper-bound sanity check (confirm the calibrated `s*` is comfortably below where Sqlt falls), not as the strength selector:
 
 ```bash
 ./run_lpips_sweep.sh --categories WM_1,WM_3,WM_4,WM_5,WM_6 \
     --strength-grid 0.0025,0.005,0.01,0.02,0.05,0.1,0.2,0.3,0.4,0.5
 ```
 
-Measured knee points per category (your own re-run may differ slightly if the templates change):
+| Category | Channel(s) | LPIPS knee (`Sqlt` drops sharply past here) | Calibrated `s*` sits at |
+|---|---|---|---|
+| WM_4 | Y (luma) | ~0.01 (`Sqlt=0.75`) | 0.0091 — near the knee, but that's where the genuine watermark is |
+| WM_3 | Y+Cb+Cr | ~0.01–0.02 | well below (0.0017–0.0079), `Sqlt≈1` |
+| WM_1 | Cb | ~0.02–0.05 | far below (0.0024), `Sqlt≈1` |
+| WM_5 | Cb/Cr | ~0.05–0.1 | far below (0.0071), `Sqlt≈1` |
+| WM_6 | DCT (Y) | **saturates at `strength≥0.04`** (interpolation factor `min(1, strength*25)`) — distribution-matched, not amplitude-additive, so calibration doesn't apply; use `0.04` | n/a |
 
-| Category | Channel(s) perturbed | LPIPS sensitivity | Knee (`Sqlt` drops sharply past here) | Default used |
-|---|---|---|---|---|
-| WM_4 | Y (luma) | highest | ~0.01 (`Sqlt=0.75`) → 0.02 already costs 63% | `0.01` |
-| WM_3 | Y+Cb+Cr | high | ~0.01–0.02 (`Sqlt=0.77→0.41`) | `0.015` |
-| WM_1 | Cb only | moderate | ~0.02–0.05 (`Sqlt=0.81→0.35`) | `0.03` |
-| WM_5 | Cb/Cr residual + LSB | low | ~0.05–0.1 (`Sqlt=0.71→0.32`) | `0.07` |
-| WM_6 | DCT (Y) | none past saturation | **saturates exactly at `strength≥0.04`** (its interpolation factor is `min(1, strength*25)`) — every value above that gives identical output, so there's no real tradeoff, just no reason to use less | `0.04` |
+Reassuringly, every calibrated `s*` sits at or below the LPIPS knee — so matching the genuine amplitude costs essentially nothing in Sqlt.
 
-These are now `forge_specialized.py`'s own defaults and `run_pipeline.sh`'s defaults (step 17) — pass `--wm1-strength`/`--wm3-strength`/etc. to either to override them if a re-run of the sweep finds different knees.
+The calibrated `s*` values are now `forge_specialized.py`'s and `run_pipeline.sh`'s defaults — pass `--wm1-strength` / `--wm3-y-strength` / `--wm3-cb-strength` / `--wm3-cr-strength` / `--wm4-strength` / `--wm5-strength` to either to override them if `calibrate_strength.py` reports different `s*` after a template change.
 
 ## 9. Generate the generic mean-residual baseline
 
@@ -381,7 +412,7 @@ python select_routing.py \
     --output /home/atml_team052/tml-task4-watermark_forging/routing.json
 ```
 
-`--specialized-dir` points directly at `forge_specialized.py`'s output (no `strength_<value>` subfolder anymore, since strength is per-category now — see step 7). `run_pipeline.sh --wm1-strength <value> --wm3-strength <value> ...` (step 17) passes the per-category strengths through to `forge_specialized.py` automatically.
+`--specialized-dir` points directly at `forge_specialized.py`'s output (no `strength_<value>` subfolder anymore, since strength is per-category/per-channel now — see step 7). `run_pipeline.sh` with its `--wmN-strength` overrides passes the calibrated per-category strengths through to `forge_specialized.py` automatically.
 
 It prints its reasoning per category (`transfer check passed`, `transfer check failed (...)`, or `no transfer check found`) so you can see exactly why each category landed where it did. Inspect the printed output and the resulting `routing.json` before treating it as final — a `"weak or partial transfer"` verdict currently also falls back to the baseline, even though step 11 suggests that case deserves more investment (bigger eps/step budget, a better surrogate) rather than an automatic fallback; edit `routing.json` by hand afterwards if you've separately validated a stronger candidate for such a category.
 
@@ -404,6 +435,16 @@ The submission directory must contain exactly:
 
 The ZIP must contain the image files at the archive root.
 
+Before submitting, verify the zip actually contains modified images for the categories you expect — `build_submission.py` silently falls back to the unmodified clean image for any missing routing path (e.g. a stale `routing.json` pointing at a directory that no longer exists), with no error:
+
+```bash
+python verify_submission.py \
+    --dataset /home/atml_team052/tml-task4-watermark_forging/dataset \
+    --zip /home/atml_team052/tml-task4-watermark_forging/final_submission.zip
+```
+
+It prints the mean/max pixel difference vs the clean target per category and flags any category that looks unmodified. WM_2/7/8 showing `~0` is expected when they route to baseline-at-clean; WM_1/3/4/5/6 showing `~0` means something is wrong (stale routing) — those should always differ.
+
 ## 15. Ablation strategy
 
 Do not evaluate only one fully combined submission.
@@ -421,9 +462,9 @@ Recommended initial sweeps:
 
 ### WM_1, WM_3, WM_4, WM_5 (continuous-strength specialized attacks)
 
-Use `run_lpips_sweep.sh` (step 6) to find each category's own knee point directly from real LPIPS, rather than picking one shared grid for all of them — they have very different sensitivity (WM_4's luma attack drops sharply by `0.02`; WM_1's chroma attack doesn't until ~`0.05`). Bracket the knee with a few values around it, e.g. for WM_1: `0.01, 0.02, 0.03, 0.04, 0.05`.
+The default strengths are amplitude-calibrated (`calibrate_strength.py`, step 8) — they reproduce the genuine watermark's amplitude, which is the principled target. The most useful ablation here is **around** the calibrated `s*`: try e.g. `0.5×`, `1×`, `2×` of `s*` per category, to confirm `1×` (the genuine amplitude) actually scores best and the relationship isn't monotonic-in-strength after all. Do NOT sweep large strengths — the calibration showed those overshoot the genuine watermark by 15–44σ and were the cause of a regression.
 
-For WM_5 specifically: the residual half follows the sweep above. The LSB half has no strength knob — it is a binary bit-plane copy applied at full strength regardless. Worth ablating the two halves independently (residual only, LSB only, both) in case one of them doesn't correspond to what the real detector reads.
+For WM_5 specifically: the residual half uses the calibrated `s*`. The LSB half has no strength knob — it is a binary bit-plane copy applied at full strength regardless. Worth ablating the two halves independently (residual only, LSB only, both) in case one of them doesn't correspond to what the real detector reads.
 
 ### WM_2, WM_7, WM_8 (surrogate+PGD; WM_3 too, for ablation comparison only)
 
@@ -481,16 +522,17 @@ Relative output paths should be avoided because Condor executes jobs in temporar
 3. Review specificity and provenance controls
 4. Generate the mean-residual baseline for all categories
 5. Run check_lsb_roundtrip.py to verify the WM_5 LSB attack survives a real PNG save/reload
-6. Run run_lpips_sweep.sh to find the real usable per-category strength ceiling, instead of guessing
-7. Generate specialized candidates (WM_1, WM_3, WM_4, WM_5, WM_6) at the per-category strengths the sweep found
-8. Train surrogate ensembles (cnn_a, cnn_b, cnn_c) for WM_2, WM_3, WM_7, WM_8
-9. Run the cross-surrogate transfer sanity check (cnn_a+cnn_b attack vs cnn_c holdout)
-10. Generate PGD candidates (cnn_a+cnn_b ensemble attack) for WM_2, WM_3, WM_7, WM_8
-11. Inspect image quality
-12. Run category ablations against the baseline
-13. Run select_routing.py (or run_pipeline.sh --wm1-strength <value> --wm3-strength <value> ...) to auto-route each category
-14. Manually review and adjust routing.json for any "weak or partial transfer" categories
-15. Build the final submission ZIP
+6. Run calibrate_strength.py to read each category's genuine watermark amplitude (the strength target)
+7. (optional) Run run_lpips_sweep.sh to confirm the calibrated strengths sit below the LPIPS knee
+8. Generate specialized candidates (WM_1, WM_3, WM_4, WM_5, WM_6) at the calibrated per-category/per-channel strengths
+9. Train surrogate ensembles (cnn_a, cnn_b, cnn_c) for WM_2, WM_3, WM_7, WM_8
+10. Run the cross-surrogate transfer sanity check (cnn_a+cnn_b attack vs cnn_c holdout)
+11. Generate PGD candidates (cnn_a+cnn_b ensemble attack) for WM_2, WM_3, WM_7, WM_8
+12. Inspect image quality
+13. Run category ablations around the calibrated strengths (0.5x / 1x / 2x), not large sweeps
+14. Run select_routing.py (or run_pipeline.sh with --wmN-strength overrides) to auto-route each category
+15. Manually review and adjust routing.json for any "weak or partial transfer" categories
+16. Build the final submission ZIP
 ```
 
 ## 18. Limitations
@@ -503,7 +545,9 @@ Therefore:
 - classifiers may learn image provenance instead of watermark structure (use `check_surrogate_transfer.py` to catch this before submitting: if an independent holdout architecture doesn't agree with the attack ensemble, the perturbation is probably overfit to provenance, not the watermark);
 - category-specific statistics must be validated out of fold;
 - surrogate attacks may not transfer to the hidden detector, even when the transfer check above looks favorable — agreement between two of your own surrogates is necessary but not sufficient evidence of transfer to the real detector;
-- low perceptual distortion must take priority over aggressive optimization -- but verify this with a real LPIPS measurement (`run_lpips_sweep.sh`), not by eye: "looks fine visually" at a low strength is a sign of *unclaimed* detection budget, not evidence the strength is well-chosen, and was the likely dominant reason an earlier submission's score capped out far below what the diagnostics suggested should be reachable;
+- **we have no local measurement of Sdet** (the real decoder's bit accuracy) — only of Sqlt (LPIPS). This is the single biggest constraint: every Sdet-affecting choice is validated only by the once-an-hour leaderboard scalar, which makes the loop nearly open. The partial fix is to build local proxies that *should* correlate with Sdet (the amplitude calibration, the surrogate transfer check) and only submit changes those proxies endorse;
+- strength is NOT "as much as the quality budget allows" — it is the genuine watermark's own amplitude, read off the sources by `calibrate_strength.py`. Maximizing within the LPIPS budget actively overshot the real watermark by 15–44σ on most channels and caused a regression. "Looks fine visually" / "Sqlt is high" only constrains the quality half, and says nothing about whether the strength reproduces the watermark;
+- amplitude calibration fixes the *magnitude* of the perturbation, not its *direction* — if the extracted template `δ̂` is a poor estimate of the true embedded `δ`, the forgery will be correctly-scaled but still point the wrong way and won't decode. Improving extraction (e.g. a denoiser-based estimate, the Watermark Copy Attack) is the next lever once amplitude is correct;
 - a hand-crafted attack with a higher diagnostic AUC is not necessarily what the real detector reads — when more than one statistically independent domain shows significant evidence for the same category (as with WM_5's LSB and residual signals), prefer combining them over picking only the highest-AUC one;
 - a feature that is correct *in memory* may not be correct *on disk* — `apply_lsb`'s original implementation set bits on a derived floating-point YCbCr value and lost 100% of them on the PNG round trip, and a second, independent bug (fixing two channels sequentially undoing each other via cross-channel coupling) was found the same way. Any attack that depends on exact pixel values, not just a statistical direction, needs a save-and-reload round-trip check (`check_lsb_roundtrip.py`) before being trusted, not just an in-memory unit test.
 

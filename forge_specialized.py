@@ -23,17 +23,24 @@ WM_2, WM_7, WM_8 are left untouched here; they are handled by the
 surrogate-classifier + PGD pipeline only, since they show no validated
 hand-crafted signal at all.
 
-Strength is per-category (--wm1-strength, --wm3-strength, ...), not a single
-shared value: sweep_lpips_strength.py / run_lpips_sweep.sh showed these
-categories have very different LPIPS sensitivity per unit strength --
-WM_4 (luma) drops sharply by strength=0.02 (Sqlt=0.37), while WM_6's DCT
-attack saturates at strength>=0.04 (its interpolation factor caps at 1.0)
-and costs almost nothing (Sqlt=0.98) even there. A single shared strength
-necessarily over- or under-drives at least one category. The defaults below
-were chosen from that sweep's knee points; re-run the sweep and override
-them if the underlying templates change.
+Strength is per-category (and per-channel for WM_3), and the defaults are
+amplitude-CALIBRATED, not chosen for maximum perceptual budget. calibrate_
+strength.py measures the genuine watermark's own amplitude from the 25
+sources (by projecting each source's residual onto the extracted template)
+and the default strengths below reproduce that amplitude, so the forgery is
+"as watermarked as a genuine source" rather than as strong as the LPIPS
+budget allows. This matters because overshooting the genuine amplitude puts
+the forgery outside the distribution of real watermarked images -- which can
+lower the real decoder's bit accuracy (Sdet) AND costs Sqlt, a double loss.
+An earlier LPIPS-budget-driven sweep (sweep_lpips_strength.py) is still
+useful for seeing where quality collapses, but the genuine amplitude, not
+the quality knee, is the correct strength target. Re-run calibrate_strength.py
+and update the defaults if the templates change.
 
-This script produces exactly one candidate set per invocation now (no more
+WM_3's three channels have different genuine amplitudes (Y is ~4.6x Cb/Cr),
+so it takes three separate strengths (--wm3-y/cb/cr-strength) instead of one.
+
+This script produces exactly one candidate set per invocation (no more
 strength_<value> subfolders) -- if you want to compare strength choices,
 run it multiple times with different --output-dir values.
 """
@@ -53,13 +60,24 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, default=Path("specialized_candidates"))
-    # Defaults are the knee points found by sweep_lpips_strength.py: roughly
-    # where Sqlt starts dropping sharply for that category's perturbed
-    # channel(s). See module docstring.
-    p.add_argument("--wm1-strength", type=float, default=0.03)
-    p.add_argument("--wm3-strength", type=float, default=0.015)
-    p.add_argument("--wm4-strength", type=float, default=0.01)
-    p.add_argument("--wm5-strength", type=float, default=0.07)
+    # Defaults are the amplitude-calibrated strengths from calibrate_strength.py:
+    # the strength at which the forgery's projection onto the watermark template
+    # matches the genuine watermark's own projection, measured from the 25
+    # sources. This reproduces the real watermark amplitude rather than
+    # maximizing within an LPIPS budget -- overshooting puts the forgery outside
+    # the genuine watermark distribution (hurting Sdet) and costs Sqlt. Re-run
+    # calibrate_strength.py and update these if the templates change.
+    p.add_argument("--wm1-strength", type=float, default=0.0024)
+    # WM_3's three channels have different genuine amplitudes (Y ~4.6x Cb/Cr),
+    # so they get separate strengths rather than one shared value.
+    p.add_argument("--wm3-y-strength", type=float, default=0.0079)
+    p.add_argument("--wm3-cb-strength", type=float, default=0.0017)
+    p.add_argument("--wm3-cr-strength", type=float, default=0.0017)
+    p.add_argument("--wm4-strength", type=float, default=0.0091)
+    p.add_argument("--wm5-strength", type=float, default=0.0071)
+    # WM_6 is distribution-matched, not amplitude-additive: its interpolation
+    # factor saturates at strength>=0.04 (full match to the source DCT
+    # distribution), so this is left at the saturation point, not calibrated.
     p.add_argument("--wm6-strength", type=float, default=0.04)
     p.add_argument("--wm4-threshold", type=float, default=0.45)
     p.add_argument("--wm6-coeff-count", type=int, default=8)
@@ -306,8 +324,10 @@ def main():
     wm6_clean_stats = dct_block_stats(by_resolution[wm6_resolution])
     wm6_coords = select_dct_coords(wm6_stats, wm6_clean_stats, args.wm6_coeff_count)
     print("WM6 DCT coeffs", wm6_coords)
+    wm3_strengths = {0: args.wm3_y_strength, 1: args.wm3_cb_strength, 2: args.wm3_cr_strength}
     print(
-        f"strengths: WM_1={args.wm1_strength} WM_3={args.wm3_strength} "
+        f"strengths: WM_1={args.wm1_strength} "
+        f"WM_3(Y/Cb/Cr)={args.wm3_y_strength}/{args.wm3_cb_strength}/{args.wm3_cr_strength} "
         f"WM_4={args.wm4_strength} WM_5={args.wm5_strength} WM_6={args.wm6_strength}"
     )
 
@@ -319,7 +339,7 @@ def main():
         elif 51 <= i <= 75:
             y = x
             for ch in WM3_CHANNELS:
-                y = apply_channel(y, wm3_channel_templates[ch], ch, args.wm3_strength)
+                y = apply_channel(y, wm3_channel_templates[ch], ch, wm3_strengths[ch])
         elif 76 <= i <= 100:
             y = apply_luma(x, wm4_phase_template, args.wm4_strength)
         elif 101 <= i <= 125:

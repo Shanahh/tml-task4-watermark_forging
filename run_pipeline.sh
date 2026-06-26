@@ -2,17 +2,18 @@
 set -eo pipefail
 
 # Usage:
-#   ./run_pipeline.sh [--wm1-strength 0.03] [--wm3-strength 0.015] \
-#                      [--wm4-strength 0.01] [--wm5-strength 0.07] [--wm6-strength 0.04]
+#   ./run_pipeline.sh [--wm1-strength 0.0024] \
+#                      [--wm3-y-strength 0.0079] [--wm3-cb-strength 0.0017] [--wm3-cr-strength 0.0017] \
+#                      [--wm4-strength 0.0091] [--wm5-strength 0.0071] [--wm6-strength 0.04]
 #
-# Strength is per-category, not a single shared value: run_lpips_sweep.sh
-# showed these categories have very different LPIPS sensitivity per unit
-# strength (e.g. WM_4's luma attack drops sharply by 0.02, while WM_6's DCT
-# attack saturates at >=0.04 at almost no perceptual cost). A single shared
-# strength necessarily over- or under-drives at least one category. The
-# defaults below are forge_specialized.py's own defaults (the knee points
-# found by the sweep) -- run ./run_lpips_sweep.sh first and override these if
-# the underlying templates change.
+# Strength is per-category (and per-channel for WM_3). The defaults below are
+# AMPLITUDE-CALIBRATED by calibrate_strength.py: they reproduce the genuine
+# watermark's own amplitude (measured from the 25 sources), rather than the
+# largest perturbation the LPIPS budget allows. Overshooting the genuine
+# amplitude puts the forgery outside the distribution of real watermarked
+# images -- which can lower the real decoder's bit accuracy (Sdet) and also
+# costs Sqlt. Run ./calibrate_strength.py to re-derive these (e.g. if the
+# templates change) and update the defaults to whatever it reports as s*.
 
 PROJECT=/home/atml_team052/tml-task4-watermark_forging
 ENV=/home/atml_team052/.conda/envs/tmltask4
@@ -22,16 +23,20 @@ export PYTHONNOUSERSITE=1
 export HF_HOME=/home/atml_team052/.cache/huggingface
 export PIP_CACHE_DIR=/home/atml_team052/.cache/pip
 
-WM1_STRENGTH="0.03"
-WM3_STRENGTH="0.015"
-WM4_STRENGTH="0.01"
-WM5_STRENGTH="0.07"
+WM1_STRENGTH="0.0024"
+WM3_Y_STRENGTH="0.0079"
+WM3_CB_STRENGTH="0.0017"
+WM3_CR_STRENGTH="0.0017"
+WM4_STRENGTH="0.0091"
+WM5_STRENGTH="0.0071"
 WM6_STRENGTH="0.04"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --wm1-strength) WM1_STRENGTH="$2"; shift 2 ;;
-        --wm3-strength) WM3_STRENGTH="$2"; shift 2 ;;
+        --wm3-y-strength) WM3_Y_STRENGTH="$2"; shift 2 ;;
+        --wm3-cb-strength) WM3_CB_STRENGTH="$2"; shift 2 ;;
+        --wm3-cr-strength) WM3_CR_STRENGTH="$2"; shift 2 ;;
         --wm4-strength) WM4_STRENGTH="$2"; shift 2 ;;
         --wm5-strength) WM5_STRENGTH="$2"; shift 2 ;;
         --wm6-strength) WM6_STRENGTH="$2"; shift 2 ;;
@@ -124,15 +129,32 @@ echo "=== [2/6] Baseline (all categories) ==="
 #    model's transferability to the real detector.
 # ---------------------------------------------------------------------------
 echo "=== [3/6] Specialized candidates (WM_1, WM_3, WM_4, WM_5, WM_6) ==="
-echo "strengths: WM_1=$WM1_STRENGTH WM_3=$WM3_STRENGTH WM_4=$WM4_STRENGTH WM_5=$WM5_STRENGTH WM_6=$WM6_STRENGTH"
+echo "strengths: WM_1=$WM1_STRENGTH WM_3(Y/Cb/Cr)=$WM3_Y_STRENGTH/$WM3_CB_STRENGTH/$WM3_CR_STRENGTH WM_4=$WM4_STRENGTH WM_5=$WM5_STRENGTH WM_6=$WM6_STRENGTH"
 "$PYTHON" "$PROJECT/forge_specialized.py" \
     --dataset "$DATASET" \
     --output-dir "$PROJECT/specialized_candidates" \
     --wm1-strength "$WM1_STRENGTH" \
-    --wm3-strength "$WM3_STRENGTH" \
+    --wm3-y-strength "$WM3_Y_STRENGTH" \
+    --wm3-cb-strength "$WM3_CB_STRENGTH" \
+    --wm3-cr-strength "$WM3_CR_STRENGTH" \
     --wm4-strength "$WM4_STRENGTH" \
     --wm5-strength "$WM5_STRENGTH" \
     --wm6-strength "$WM6_STRENGTH"
+
+# Informational: confirm the specialized strengths land within the genuine
+# watermark amplitude cluster (z@now ~ 0 = match). A large |z| means the
+# chosen strength over/under-drives the real watermark -- re-derive with
+# calibrate_strength.py if so. Does not stop the pipeline.
+echo "--- strength calibration check ---"
+"$PYTHON" "$PROJECT/calibrate_strength.py" \
+    --dataset "$DATASET" \
+    --wm1-strength "$WM1_STRENGTH" \
+    --wm3-y-strength "$WM3_Y_STRENGTH" \
+    --wm3-cb-strength "$WM3_CB_STRENGTH" \
+    --wm3-cr-strength "$WM3_CR_STRENGTH" \
+    --wm4-strength "$WM4_STRENGTH" \
+    --wm5-strength "$WM5_STRENGTH" \
+    --output "$PROJECT/strength_calibration.json" || true
 
 # ---------------------------------------------------------------------------
 # 5. Surrogate-classifier ensembles for categories with no validated
