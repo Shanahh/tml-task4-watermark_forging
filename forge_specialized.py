@@ -150,6 +150,17 @@ def parse_args():
         "calibrated default strengths were derived for 'highpass' -- re-run "
         "calibrate_strength.py --extraction denoiser and pass the new strengths.",
     )
+    p.add_argument(
+        "--block-match-strength",
+        type=float,
+        default=0.0,
+        help="OPT-IN (default 0 = off, byte-identical to before): additionally apply "
+        "block-distribution matching (see apply_block_match) on top of the global "
+        "template for WM_1/3/4. score_with_diagnostics.py showed amplitude-calibrated "
+        "global templates only weakly reproduce the genuine watermark's block-level "
+        "signature; this targets that directly. Try 1.0 (full transplant) first.",
+    )
+    p.add_argument("--block-match-grid", type=int, default=8)
     return p.parse_args()
 
 
@@ -173,6 +184,65 @@ def apply_channel(x, template, ch, strength):
     y = rgb_to_ycbcr(x)
     y[..., ch] = np.clip(y[..., ch] + strength * template, 0, 1)
     return ycbcr_to_rgb(y)
+
+
+# --------------------------------------------------------------------------
+# Block-distribution matching (opt-in, --block-match-strength > 0).
+#
+# score_with_diagnostics.py showed that amplitude-calibrating a single GLOBAL
+# scalar projection of the channel template (above) only weakly reproduces
+# the genuine watermark's signature under the richer classifier features
+# (8x8 block-mean residual stats) that originally justified each attack --
+# even though the global projection itself matches by construction. Matching
+# one coarse number doesn't guarantee the full spatial distribution lands.
+#
+# This generalizes WM_6's apply_dct (which matches the full per-coefficient
+# DCT distribution, not a scalar) to the spatial domain: for each cell of an
+# 8x8 grid over the channel residual, shift that cell's mean from where it
+# sits in the clean-negative distribution to the equivalent position in the
+# genuine-source distribution (z-score transplant, same mechanism as
+# apply_dct). This is additive on top of the existing global template.
+# --------------------------------------------------------------------------
+
+def block_grid_means(residual, grid=8):
+    h, w = residual.shape
+    ys = np.linspace(0, h, grid + 1, dtype=int)
+    xs = np.linspace(0, w, grid + 1, dtype=int)
+    means = np.zeros((grid, grid))
+    for yi in range(grid):
+        for xi in range(grid):
+            means[yi, xi] = residual[ys[yi]:ys[yi + 1], xs[xi]:xs[xi + 1]].mean()
+    return means, ys, xs
+
+
+def expand_grid(values, ys, xs, shape):
+    out = np.zeros(shape)
+    grid = values.shape[0]
+    for yi in range(grid):
+        for xi in range(grid):
+            out[ys[yi]:ys[yi + 1], xs[xi]:xs[xi + 1]] = values[yi, xi]
+    return out
+
+
+def block_match_stats(xs, ch, method, grid=8):
+    """Per-cell mean/std of the channel residual's block means, across a set
+    of images (sources for the genuine-watermark target, same-resolution
+    clean images for the baseline)."""
+    cell_means = [block_grid_means(channel_residual(x, ch, method), grid)[0] for x in xs]
+    stacked = np.stack(cell_means)
+    return stacked.mean(0), stacked.std(0) + EPS
+
+
+def apply_block_match(x, ch, method, ws_mean, ws_std, cs_mean, cs_std, strength, grid=8):
+    ycc = rgb_to_ycbcr(x)
+    channel = ycc[..., ch]
+    residual = channel - estimate_content(channel, method)
+    cur_mean, ys, xs = block_grid_means(residual, grid)
+    z = (cur_mean - cs_mean) / cs_std
+    target_mean = ws_mean + z * ws_std
+    offset = expand_grid((target_mean - cur_mean) * strength, ys, xs, channel.shape)
+    ycc[..., ch] = np.clip(channel + offset, 0, 1)
+    return ycbcr_to_rgb(ycc)
 
 
 # --------------------------------------------------------------------------
@@ -401,20 +471,45 @@ def main():
     print(
         f"extraction={method} | strengths: WM_1={args.wm1_strength} "
         f"WM_3(Y/Cb/Cr)={args.wm3_y_strength}/{args.wm3_cb_strength}/{args.wm3_cr_strength} "
-        f"WM_4={args.wm4_strength} WM_5={args.wm5_strength} WM_6={args.wm6_strength}"
+        f"WM_4={args.wm4_strength} WM_5={args.wm5_strength} WM_6={args.wm6_strength} "
+        f"block_match_strength={args.block_match_strength}"
     )
+
+    # Block-distribution matching is opt-in (default strength 0 = skipped
+    # entirely, so the default path's cost and output are unchanged).
+    block_stats = {}
+    if args.block_match_strength > 0:
+        grid = args.block_match_grid
+        for cat, ch in [("WM_1", 1), ("WM_3", 0), ("WM_3", 1), ("WM_3", 2), ("WM_4", 0)]:
+            resolution = (src[cat][0].shape[1], src[cat][0].shape[0])
+            ws_mean, ws_std = block_match_stats(src[cat], ch, method, grid)
+            cs_mean, cs_std = block_match_stats(by_resolution[resolution], ch, method, grid)
+            block_stats[(cat, ch)] = (ws_mean, ws_std, cs_mean, cs_std)
+
+    def maybe_block_match(y, cat, ch):
+        if args.block_match_strength <= 0:
+            return y
+        ws_mean, ws_std, cs_mean, cs_std = block_stats[(cat, ch)]
+        return apply_block_match(
+            y, ch, method, ws_mean, ws_std, cs_mean, cs_std,
+            args.block_match_strength, args.block_match_grid,
+        )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     for i, x in clean.items():
         if 1 <= i <= 25:
             y = apply_channel(x, wm1_cb_template, 1, args.wm1_strength)
+            y = maybe_block_match(y, "WM_1", 1)
         elif 51 <= i <= 75:
             y = x
             for ch in WM3_CHANNELS:
                 y = apply_channel(y, wm3_channel_templates[ch], ch, wm3_strengths[ch])
+            for ch in WM3_CHANNELS:
+                y = maybe_block_match(y, "WM_3", ch)
         elif 76 <= i <= 100:
             y = apply_luma(x, wm4_phase_template, args.wm4_strength)
+            y = maybe_block_match(y, "WM_4", 0)
         elif 101 <= i <= 125:
             y = apply_channel(x, wm5_cb_template, 1, args.wm5_strength)
             y = apply_channel(y, wm5_cr_template, 2, args.wm5_strength)
