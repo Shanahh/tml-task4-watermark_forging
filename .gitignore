@@ -4,3 +4,4 @@ runlogs/
 *.zip
 clean_targets/
 watermarked_sources/
+simple_candidates/
