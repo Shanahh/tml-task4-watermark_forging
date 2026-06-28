@@ -23,6 +23,16 @@ repo high-pass filters before averaging. If raw averaging does no better
 than 0.22, the high-pass assumption probably isn't the problem. If it does
 the same or better with far less machinery, it's the floor everything else
 should have been validated against.
+
+Validated on the leaderboard: a single shared strength took the score from
+0.22 -> 0.265 (s=0.3) -> 0.295 (s=0.5), then plateaued at s=0.6. Strength is
+now per-category (--wm1-strength ... --wm8-strength, still nothing else
+added) since the 8 watermarks are independent and likely have different real
+embedding strengths, so a single shared value is necessarily a compromise --
+the same lesson learned with the calibrated specialized pipeline, reapplied
+here without bringing back any of that pipeline's other machinery. Defaults
+are all 0.5 (the best uniform value found so far), so running with no
+overrides reproduces that submission exactly.
 """
 from __future__ import annotations
 
@@ -38,13 +48,16 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, default=Path("simple_candidates"))
-    p.add_argument("--strength", type=float, default=1.0)
+    for category in CATEGORIES:
+        p.add_argument(f"--{category.lower().replace('_', '')}-strength", type=float, default=0.5)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     src, clean = load_dataset(args.dataset)
+    strengths = {c: getattr(args, f"{c.lower().replace('_', '')}_strength") for c in CATEGORIES}
+    print("strengths:", " ".join(f"{c}={strengths[c]}" for c in CATEGORIES))
 
     by_resolution = {}
     for im in clean.values():
@@ -59,8 +72,8 @@ def main():
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for i, x in clean.items():
-        delta = deltas[category_for_id(i)]
-        forged = np.clip(x + args.strength * delta, 0, 1)
+        category = category_for_id(i)
+        forged = np.clip(x + strengths[category] * deltas[category], 0, 1)
         save_rgb(forged, args.output_dir / f"{i}.png")
 
     print("saved", args.output_dir)
