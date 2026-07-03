@@ -36,28 +36,37 @@ overrides reproduces that submission exactly.
 
 Per-category delta EXTRACTION (--wmN-extraction, default raw):
 
-    raw      delta = mean(sources) - mean(clean_pool)           [default]
-    denoise  delta = mean over sources of [source - denoise(source)],
-             then rescaled to the raw delta's per-category RMS.
+    raw       delta = mean(sources) - mean(clean_pool)          [default]
+    denoise   delta = mean over sources of [source - denoise(source)]
+    wmcopier  raw delta with the clean-image content subspace projected out
 
-The 'denoise' estimate removes each source's OWN content (via a wavelet
-denoiser -- the Watermark Copy Attack extractor) before averaging, instead
-of subtracting a foreign clean pool's mean. That drops the content-bias term
-in the raw estimate (mean-content-of-sources minus mean-content-of-pool,
-which does not fully cancel with only 25 sources), so for a noise-like
-watermark it should give a cleaner delta DIRECTION -- the thing that helps
-categories whose score is flat or falling in strength (delta points slightly
-wrong), where more magnitude cannot help. NOTE: this is NOT the high-pass
-mistake -- high-pass removes low frequencies (incl. low-freq watermark); a
-denoiser keeps the noise-like watermark and removes content (opposite
-selectivity).
+All non-raw variants are rescaled to the raw delta's per-category RMS, so the
+strength range is identical and raw-vs-X is a clean single-variable
+comparison: same perturbation amplitude, only the DIRECTION differs.
 
-The denoise residual is ~200-500x smaller in RMS than the raw delta (the raw
-delta is dominated by low-frequency content-bias the denoiser excludes), so
-it is rescaled to the raw delta's RMS. This keeps the strength range
-identical to the raw attack AND makes raw-vs-denoise a clean single-variable
-comparison: same perturbation amplitude, only the DIRECTION differs. Opt-in
-per category; default raw reproduces the tuned result.
+'denoise' removes each source's OWN content (wavelet Watermark-Copy-Attack
+extractor) before averaging, dropping the content-bias term (mean-content-of-
+sources minus mean-content-of-pool, which does not fully cancel with 25
+sources). NOT the high-pass mistake -- a denoiser keeps the noise-like
+watermark and removes content, the opposite selectivity from high-pass.
+
+'wmcopier' is a FEASIBLE LINEAR ADAPTATION of WMCopier (Dong et al., NeurIPS
+2025), NOT the paper's diffusion method. The real WMCopier trains an
+unconditional diffusion model on a large self-generated watermarked dataset
+to separate watermark from content -- infeasible here (black-box, 25 samples,
+no watermark encoder). Its core idea, though, is separating the watermark
+from image content. This does that linearly: the raw delta = watermark +
+content-bias, where the content-bias lies in the subspace of natural-image
+variation. We estimate that subspace as the top-k principal components of the
+clean-image pool and project it out of the delta, leaving the part orthogonal
+to content (more likely the watermark). Hyperparameter --wmN-components (k,
+default 8) trades bias (small k leaves content-bias in) against variance
+(large k also removes any watermark energy that overlaps content directions).
+k=0 reduces to the raw delta. Best suited to the content-contaminated groups
+(those that wanted LOW strength in the raw sweep, e.g. wm4/wm8), and wm1
+(flat to strength = direction, not magnitude, is the limit).
+
+Opt-in per category; default raw reproduces the tuned result.
 """
 from __future__ import annotations
 
@@ -69,7 +78,7 @@ import numpy as np
 from common import CATEGORIES, load_dataset, save_rgb, category_for_id
 from forge_specialized import estimate_content
 
-EXTRACTION_CHOICES = ("raw", "denoise")
+EXTRACTION_CHOICES = ("raw", "denoise", "wmcopier")
 
 
 def arg_name(category, suffix):
@@ -84,6 +93,8 @@ def parse_args():
         stem = category.lower().replace("_", "")
         p.add_argument(f"--{stem}-strength", type=float, default=0.5)
         p.add_argument(f"--{stem}-extraction", choices=EXTRACTION_CHOICES, default="raw")
+        p.add_argument(f"--{stem}-components", type=int, default=8,
+                        help="wmcopier extraction: number of clean-content PCs to project out")
     return p.parse_args()
 
 
@@ -103,6 +114,40 @@ def denoise_delta(sources):
     return np.mean(residuals, axis=0)
 
 
+def wmcopier_delta(sources, clean_pool, n_components):
+    """WMCopier-inspired linear watermark/content separation: take the raw
+    mean-difference delta and project out the top-n_components principal
+    directions of the clean-image pool (the natural-image-content subspace
+    that the content-bias term lives in), keeping the part orthogonal to
+    content. n_components=0 returns the raw delta unchanged.
+
+    The clean-pool PCs are computed via the Gram trick (eigendecomposition of
+    the small N x N covariance of the flattened, mean-centered clean images),
+    so this is cheap even at full image resolution.
+    """
+    delta = raw_delta(sources, clean_pool)
+    if n_components <= 0:
+        return delta
+
+    # np.errstate: large-K matmul spuriously trips NumPy 2.x's FP-state check
+    # ("divide by zero encountered in matmul") though the result is exact.
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        flat = np.stack([c.ravel() for c in clean_pool]).astype(np.float64)
+        centered = flat - flat.mean(0)
+        gram = centered @ centered.T
+        eigvals, eigvecs = np.linalg.eigh(gram)
+        order = np.argsort(eigvals)[::-1][:n_components]
+
+        d = delta.ravel().astype(np.float64)
+        for j in order:
+            if eigvals[j] <= 1e-12:
+                continue
+            pc = centered.T @ eigvecs[:, j]
+            pc /= np.linalg.norm(pc) + 1e-12
+            d -= (d @ pc) * pc
+    return d.reshape(delta.shape).astype(delta.dtype)
+
+
 def rms(a):
     return float(np.sqrt((a ** 2).mean()))
 
@@ -112,7 +157,14 @@ def main():
     src, clean = load_dataset(args.dataset)
     strengths = {c: getattr(args, arg_name(c, "strength")) for c in CATEGORIES}
     extractions = {c: getattr(args, arg_name(c, "extraction")) for c in CATEGORIES}
-    print("config:", " ".join(f"{c}={strengths[c]}/{extractions[c]}" for c in CATEGORIES))
+    components = {c: getattr(args, arg_name(c, "components")) for c in CATEGORIES}
+
+    def describe(c):
+        tag = extractions[c]
+        if tag == "wmcopier":
+            tag += f"(k={components[c]})"
+        return f"{c}={strengths[c]}/{tag}"
+    print("config:", " ".join(describe(c) for c in CATEGORIES))
 
     by_resolution = {}
     for im in clean.values():
@@ -121,14 +173,20 @@ def main():
     deltas = {}
     for category in CATEGORIES:
         sources = src[category]
-        rd = raw_delta(sources, by_resolution[sources[0].shape[:2]])
-        if extractions[category] == "denoise":
-            dd = denoise_delta(sources)
-            # Rescale to the raw delta's RMS: same amplitude, direction-only
-            # difference, and the same strength range as the raw attack.
-            deltas[category] = dd * (rms(rd) / (rms(dd) + 1e-12))
+        clean_pool = by_resolution[sources[0].shape[:2]]
+        rd = raw_delta(sources, clean_pool)
+        method = extractions[category]
+        if method == "denoise":
+            estimate = denoise_delta(sources)
+        elif method == "wmcopier":
+            estimate = wmcopier_delta(sources, clean_pool, components[category])
         else:
-            deltas[category] = rd
+            estimate = rd
+        # Rescale any non-raw estimate to the raw delta's RMS: same amplitude,
+        # direction-only difference, same strength range as the raw attack.
+        if method != "raw":
+            estimate = estimate * (rms(rd) / (rms(estimate) + 1e-12))
+        deltas[category] = estimate
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for i, x in clean.items():
