@@ -33,6 +33,31 @@ the same lesson learned with the calibrated specialized pipeline, reapplied
 here without bringing back any of that pipeline's other machinery. Defaults
 are all 0.5 (the best uniform value found so far), so running with no
 overrides reproduces that submission exactly.
+
+Per-category delta EXTRACTION (--wmN-extraction, default raw):
+
+    raw      delta = mean(sources) - mean(clean_pool)           [default]
+    denoise  delta = mean over sources of [source - denoise(source)],
+             then rescaled to the raw delta's per-category RMS.
+
+The 'denoise' estimate removes each source's OWN content (via a wavelet
+denoiser -- the Watermark Copy Attack extractor) before averaging, instead
+of subtracting a foreign clean pool's mean. That drops the content-bias term
+in the raw estimate (mean-content-of-sources minus mean-content-of-pool,
+which does not fully cancel with only 25 sources), so for a noise-like
+watermark it should give a cleaner delta DIRECTION -- the thing that helps
+categories whose score is flat or falling in strength (delta points slightly
+wrong), where more magnitude cannot help. NOTE: this is NOT the high-pass
+mistake -- high-pass removes low frequencies (incl. low-freq watermark); a
+denoiser keeps the noise-like watermark and removes content (opposite
+selectivity).
+
+The denoise residual is ~200-500x smaller in RMS than the raw delta (the raw
+delta is dominated by low-frequency content-bias the denoiser excludes), so
+it is rescaled to the raw delta's RMS. This keeps the strength range
+identical to the raw attack AND makes raw-vs-denoise a clean single-variable
+comparison: same perturbation amplitude, only the DIRECTION differs. Opt-in
+per category; default raw reproduces the tuned result.
 """
 from __future__ import annotations
 
@@ -42,6 +67,13 @@ from pathlib import Path
 import numpy as np
 
 from common import CATEGORIES, load_dataset, save_rgb, category_for_id
+from forge_specialized import estimate_content
+
+EXTRACTION_CHOICES = ("raw", "denoise")
+
+
+def arg_name(category, suffix):
+    return f"{category.lower().replace('_', '')}_{suffix}"
 
 
 def parse_args():
@@ -49,15 +81,38 @@ def parse_args():
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, default=Path("simple_candidates"))
     for category in CATEGORIES:
-        p.add_argument(f"--{category.lower().replace('_', '')}-strength", type=float, default=0.5)
+        stem = category.lower().replace("_", "")
+        p.add_argument(f"--{stem}-strength", type=float, default=0.5)
+        p.add_argument(f"--{stem}-extraction", choices=EXTRACTION_CHOICES, default="raw")
     return p.parse_args()
+
+
+def raw_delta(sources, clean_pool):
+    return np.mean(sources, axis=0) - np.mean(clean_pool, axis=0)
+
+
+def denoise_delta(sources):
+    """Per-source watermark estimate source - denoise(source), averaged.
+    Denoises each RGB channel independently."""
+    residuals = []
+    for x in sources:
+        residual = np.empty_like(x)
+        for c in range(x.shape[-1]):
+            residual[..., c] = x[..., c] - estimate_content(x[..., c], "denoiser")
+        residuals.append(residual)
+    return np.mean(residuals, axis=0)
+
+
+def rms(a):
+    return float(np.sqrt((a ** 2).mean()))
 
 
 def main():
     args = parse_args()
     src, clean = load_dataset(args.dataset)
-    strengths = {c: getattr(args, f"{c.lower().replace('_', '')}_strength") for c in CATEGORIES}
-    print("strengths:", " ".join(f"{c}={strengths[c]}" for c in CATEGORIES))
+    strengths = {c: getattr(args, arg_name(c, "strength")) for c in CATEGORIES}
+    extractions = {c: getattr(args, arg_name(c, "extraction")) for c in CATEGORIES}
+    print("config:", " ".join(f"{c}={strengths[c]}/{extractions[c]}" for c in CATEGORIES))
 
     by_resolution = {}
     for im in clean.values():
@@ -66,9 +121,14 @@ def main():
     deltas = {}
     for category in CATEGORIES:
         sources = src[category]
-        resolution = sources[0].shape[:2]
-        clean_pool = by_resolution[resolution]
-        deltas[category] = np.mean(sources, axis=0) - np.mean(clean_pool, axis=0)
+        rd = raw_delta(sources, by_resolution[sources[0].shape[:2]])
+        if extractions[category] == "denoise":
+            dd = denoise_delta(sources)
+            # Rescale to the raw delta's RMS: same amplitude, direction-only
+            # difference, and the same strength range as the raw attack.
+            deltas[category] = dd * (rms(rd) / (rms(dd) + 1e-12))
+        else:
+            deltas[category] = rd
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for i, x in clean.items():
