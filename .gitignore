@@ -5,3 +5,14 @@ runlogs/
 clean_targets/
 watermarked_sources/
 simple_candidates/
+simple_submission_*
+baseline_candidates/
+diagnostics/
+diagnostics_validated/
+final_submission/
+pgd_candidates/
+specialized_candidates/
+submissions/
+surrogates/
+wm3_candidates/
+wm3_surrogates/
