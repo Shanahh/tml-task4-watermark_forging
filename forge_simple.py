@@ -37,12 +37,25 @@ overrides reproduces that submission exactly.
 Per-category delta EXTRACTION (--wmN-extraction, default raw):
 
     raw       delta = mean(sources) - mean(clean_pool)          [default]
-    denoise   delta = mean over sources of [source - denoise(source)]
+    denoise   delta = mean over sources of [source - wavelet_denoise(source)]
+    regen     same, but with a STRONG denoiser (BM3D) -- the copy attack
     wmcopier  raw delta with the clean-image content subspace projected out
 
 All non-raw variants are rescaled to the raw delta's per-category RMS, so the
 strength range is identical and raw-vs-X is a clean single-variable
 comparison: same perturbation amplitude, only the DIRECTION differs.
+
+'regen' is the regeneration/copy attack: remove each source's content with
+BM3D (a strong denoiser) and average the residuals, giving a clean watermark
+with no foreign-pool content-bias. Measured watermark-consistency across
+sources (||mean residual||^2 / mean ||residual||^2) shows this is a 3-4x
+cleaner watermark than raw averaging for the copyable groups WM_5 (0.13->0.39)
+and WM_6 (0.09->0.31), a weak win for WM_4, and NO help for WM_1/2/3/7/8
+(their residual is not consistent under any denoiser -- content-adaptive or
+semantic watermarks with no fixed pattern to copy; WM_3 is actually best with
+raw). So regen is a targeted win for the additive groups, not a universal
+fix. Needs `pip install bm3d`. Tune --wmN-regen-sigma (BM3D noise std, default
+0.02; ~watermark amplitude to keep).
 
 'denoise' removes each source's OWN content (wavelet Watermark-Copy-Attack
 extractor) before averaging, dropping the content-bias term (mean-content-of-
@@ -91,7 +104,7 @@ import numpy as np
 from common import CATEGORIES, load_dataset, save_rgb, category_for_id
 from forge_specialized import estimate_content
 
-EXTRACTION_CHOICES = ("raw", "denoise", "wmcopier")
+EXTRACTION_CHOICES = ("raw", "denoise", "wmcopier", "regen")
 
 
 def arg_name(category, suffix):
@@ -108,6 +121,9 @@ def parse_args():
         p.add_argument(f"--{stem}-extraction", choices=EXTRACTION_CHOICES, default="raw")
         p.add_argument(f"--{stem}-components", type=int, default=8,
                         help="wmcopier extraction: number of clean-content PCs to project out")
+        p.add_argument(f"--{stem}-regen-sigma", type=float, default=0.02,
+                        help="regen extraction: BM3D denoiser noise std (the watermark amplitude "
+                             "to keep in the residual)")
         p.add_argument(f"--{stem}-lpips-cap", type=float, default=0.0,
                         help="if >0, per-image strength is binary-searched to this LPIPS cap "
                              "instead of using the fixed strength")
@@ -159,12 +175,36 @@ def raw_delta(sources, clean_pool):
 
 def denoise_delta(sources):
     """Per-source watermark estimate source - denoise(source), averaged.
-    Denoises each RGB channel independently."""
+    Denoises each RGB channel independently with the wavelet denoiser."""
     residuals = []
     for x in sources:
         residual = np.empty_like(x)
         for c in range(x.shape[-1]):
             residual[..., c] = x[..., c] - estimate_content(x[..., c], "denoiser")
+        residuals.append(residual)
+    return np.mean(residuals, axis=0)
+
+
+def regen_delta(sources, sigma):
+    """Regeneration/copy-attack extraction: source - denoise(source) averaged,
+    but with a STRONG denoiser (BM3D) instead of the weak wavelet. BM3D removes
+    each source's content while leaving the watermark in the residual, so with
+    no foreign-pool content-bias term the averaged residual is a much cleaner
+    watermark for content-independent (additive) watermarks. Verified to
+    isolate a 3-4x more consistent watermark than raw averaging for the
+    copyable groups (WM_5, WM_6); does nothing for content-adaptive/semantic
+    groups (WM_1/2/7/8), whose per-source residual is not consistent under any
+    denoiser. `sigma` is BM3D's noise std -- roughly the watermark amplitude to
+    preserve in the residual."""
+    try:
+        import bm3d
+    except ImportError as e:
+        raise SystemExit("regen extraction needs BM3D: pip install bm3d") from e
+    residuals = []
+    for x in sources:
+        residual = np.empty_like(x)
+        for c in range(x.shape[-1]):
+            residual[..., c] = x[..., c] - bm3d.bm3d(x[..., c], sigma_psd=sigma)
         residuals.append(residual)
     return np.mean(residuals, axis=0)
 
@@ -213,12 +253,15 @@ def main():
     strengths = {c: getattr(args, arg_name(c, "strength")) for c in CATEGORIES}
     extractions = {c: getattr(args, arg_name(c, "extraction")) for c in CATEGORIES}
     components = {c: getattr(args, arg_name(c, "components")) for c in CATEGORIES}
+    regen_sigmas = {c: getattr(args, arg_name(c, "regen_sigma")) for c in CATEGORIES}
     caps = {c: getattr(args, arg_name(c, "lpips_cap")) for c in CATEGORIES}
 
     def describe(c):
         tag = extractions[c]
         if tag == "wmcopier":
             tag += f"(k={components[c]})"
+        elif tag == "regen":
+            tag += f"(sig={regen_sigmas[c]})"
         knob = f"cap={caps[c]}" if caps[c] > 0 else f"s={strengths[c]}"
         return f"{c}:{knob}/{tag}"
     print("config:", " ".join(describe(c) for c in CATEGORIES))
@@ -237,6 +280,8 @@ def main():
             estimate = denoise_delta(sources)
         elif method == "wmcopier":
             estimate = wmcopier_delta(sources, clean_pool, components[category])
+        elif method == "regen":
+            estimate = regen_delta(sources, regen_sigmas[category])
         else:
             estimate = rd
         # Rescale any non-raw estimate to the raw delta's RMS: same amplitude,
