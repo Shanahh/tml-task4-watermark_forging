@@ -67,6 +67,19 @@ k=0 reduces to the raw delta. Best suited to the content-contaminated groups
 (flat to strength = direction, not magnitude, is the limit).
 
 Opt-in per category; default raw reproduces the tuned result.
+
+Per-category LPIPS CAP (--wmN-lpips-cap, default 0 = off = fixed strength):
+
+Instead of one fixed strength for all 25 images in a group, cap mode gives
+each image the LARGEST strength that keeps its LPIPS under the cap -- so every
+image ends at the same quality Sqlt = exp(-8*cap) but the maximum detection
+strength it can afford. This is a strictly better allocation of a fixed
+quality budget than a single group strength (more watermark on images that
+tolerate it, less on those that don't), which directly targets the score
+mean(Sdet*Sqlt). The per-image strength is found by binary search in
+[0, --max-strength]; the group's --wmN-strength is ignored when its cap > 0.
+A good starting cap for a group is the LPIPS its best fixed strength was
+already producing -- run with --report-lpips to print that per group.
 """
 from __future__ import annotations
 
@@ -95,7 +108,49 @@ def parse_args():
         p.add_argument(f"--{stem}-extraction", choices=EXTRACTION_CHOICES, default="raw")
         p.add_argument(f"--{stem}-components", type=int, default=8,
                         help="wmcopier extraction: number of clean-content PCs to project out")
+        p.add_argument(f"--{stem}-lpips-cap", type=float, default=0.0,
+                        help="if >0, per-image strength is binary-searched to this LPIPS cap "
+                             "instead of using the fixed strength")
+    p.add_argument("--max-strength", type=float, default=3.0,
+                    help="ceiling for the per-image binary search in LPIPS-cap mode")
+    p.add_argument("--lpips-net", default="alex", choices=["alex", "vgg"])
+    p.add_argument("--report-lpips", action="store_true",
+                    help="print each group's mean LPIPS of the final output (guides cap selection)")
     return p.parse_args()
+
+
+def load_lpips(net_name):
+    import torch
+    import lpips
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = lpips.LPIPS(net=net_name).to(device).eval()
+    for param in net.parameters():
+        param.requires_grad_(False)
+
+    def distance(a, b):
+        ta = torch.from_numpy(np.transpose(a, (2, 0, 1))).unsqueeze(0).float().to(device)
+        tb = torch.from_numpy(np.transpose(b, (2, 0, 1))).unsqueeze(0).float().to(device)
+        with torch.no_grad():
+            return float(net(ta, tb, normalize=True))
+
+    return distance
+
+
+def cap_strength(x, delta, cap, max_strength, lpips_distance, iters=12):
+    """Largest strength s in [0, max_strength] with LPIPS(x, clip(x+s*delta))
+    <= cap, by binary search. If even max_strength stays under the cap (delta
+    too weak to reach it), returns max_strength."""
+    if lpips_distance(x, np.clip(x + max_strength * delta, 0, 1)) <= cap:
+        return max_strength
+    lo, hi = 0.0, max_strength
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        if lpips_distance(x, np.clip(x + mid * delta, 0, 1)) <= cap:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 def raw_delta(sources, clean_pool):
@@ -158,12 +213,14 @@ def main():
     strengths = {c: getattr(args, arg_name(c, "strength")) for c in CATEGORIES}
     extractions = {c: getattr(args, arg_name(c, "extraction")) for c in CATEGORIES}
     components = {c: getattr(args, arg_name(c, "components")) for c in CATEGORIES}
+    caps = {c: getattr(args, arg_name(c, "lpips_cap")) for c in CATEGORIES}
 
     def describe(c):
         tag = extractions[c]
         if tag == "wmcopier":
             tag += f"(k={components[c]})"
-        return f"{c}={strengths[c]}/{tag}"
+        knob = f"cap={caps[c]}" if caps[c] > 0 else f"s={strengths[c]}"
+        return f"{c}:{knob}/{tag}"
     print("config:", " ".join(describe(c) for c in CATEGORIES))
 
     by_resolution = {}
@@ -188,13 +245,33 @@ def main():
             estimate = estimate * (rms(rd) / (rms(estimate) + 1e-12))
         deltas[category] = estimate
 
+    # LPIPS is only needed if some group uses a cap, or we're reporting.
+    need_lpips = any(caps[c] > 0 for c in CATEGORIES) or args.report_lpips
+    lpips_distance = load_lpips(args.lpips_net) if need_lpips else None
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    group_lpips = {c: [] for c in CATEGORIES}
     for i, x in clean.items():
         category = category_for_id(i)
-        forged = np.clip(x + strengths[category] * deltas[category], 0, 1)
+        delta = deltas[category]
+        if caps[category] > 0:
+            s = cap_strength(x, delta, caps[category], args.max_strength, lpips_distance)
+        else:
+            s = strengths[category]
+        forged = np.clip(x + s * delta, 0, 1)
+        if lpips_distance is not None:
+            group_lpips[category].append(lpips_distance(x, forged))
         save_rgb(forged, args.output_dir / f"{i}.png")
 
     print("saved", args.output_dir)
+
+    if lpips_distance is not None:
+        print("per-group mean LPIPS (Sqlt = exp(-8*LPIPS)):")
+        for c in CATEGORIES:
+            vals = group_lpips[c]
+            if vals:
+                mean_lp = float(np.mean(vals))
+                print(f"  {c}: mean_lpips={mean_lp:.4f}  Sqlt={np.exp(-8 * mean_lp):.4f}")
 
 
 if __name__ == "__main__":
