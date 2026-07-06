@@ -6,6 +6,7 @@ clean_targets/
 watermarked_sources/
 simple_candidates/
 simple_submission_*
+known_scheme_candidates/
 baseline_candidates/
 diagnostics/
 diagnostics_validated/
