@@ -5,16 +5,18 @@ estimating the watermark statistically.
 
 Rationale: the task's reference papers (WMCopier, Watermark Copy Attack, etc.)
 all benchmark against a small set of standard schemes with public pip-
-installable encode/decode implementations (DwtDct, DwtDctSvd, RivaGAN via the
-`invisible-watermark` package; a separate DWT+DCT+SVD blind scheme via
-`blind-watermark`). If a group's 25 sources actually came from one of these,
-running that scheme's OWN decoder on them should recover the SAME message
-bits consistently across all 25 images -- not because we estimated anything,
-but because we're reading out the real embedding with the real algorithm.
-That is qualitatively different from (and far stronger than) any statistical
-delta estimate: if a match is found, the SAME library's encoder can then embed
-that exact message on the clean targets directly, for near-perfect bit
-accuracy at near-zero perceptual cost.
+installable encode/decode implementations: DwtDct, DwtDctSvd, RivaGAN (via
+`invisible-watermark`); a separate DWT+DCT+SVD blind scheme (via
+`blind-watermark`); and TrustMark, a modern deep encoder/decoder scheme (via
+`trustmark`) purpose-built for exactly this content-provenance use case. If a
+group's 25 sources actually came from one of these, running that scheme's OWN
+decoder on them should recover the SAME message bits consistently across all
+25 images -- not because we estimated anything, but because we're reading out
+the real embedding with the real algorithm. That is qualitatively different
+from (and far stronger than) any statistical delta estimate: if a match is
+found, the SAME library's encoder can then embed that exact message on the
+clean targets directly, for near-perfect bit accuracy at near-zero perceptual
+cost.
 
 Method: for each candidate scheme/parameter combination, decode all 25
 sources of a group and measure bit-AGREEMENT with the per-bit majority vote
@@ -24,15 +26,30 @@ scheme/param combo is flagged as a plausible match only if source agreement
 is both high in absolute terms AND clearly above the clean-image control
 (ruling out a scheme that just happens to produce stable-looking output on
 any image, e.g. because of block-level DC energy rather than an actual
-embedded bit).
+embedded bit) AND the recovered majority bit string is roughly balanced
+(30-70% ones) -- a majority near all-0s/all-1s is a decode-bias artifact, not
+a real message. Confirmed empirically: WM_1 vs dwtDct(default params) looked
+like a hit (91% agreement) but its majority was ~95% ones and changed
+structure between bit-lengths -- a false positive this filter now catches.
+The genuine match found so far (WM_2 vs rivaGan, 32-bit message
+00010000101111110011101011101000, 98.9% agreement vs 62.6% control, balanced
+16/32 ones) round-trips perfectly through the real encoder.
+
+Classical scheme parameter sweep: dwtDct/dwtDctSvd's blind decode reads bits
+via modular arithmetic on a DCT/DWT coefficient (`coefficient % scale`), so
+the exact `scale` value used at encode time genuinely matters for correct
+decoding -- an untried scale is not the same test as an untried bit-length.
+Both methods also structurally only ever touch Y (channel index 0) and
+Cb/U (index 1) of YUV -- never Cr/V -- so the channel sweep only varies those
+two.
 
 This is a SCREENING tool, not a guarantee -- a match should be confirmed by
-visually inspecting the recovered message for structure (e.g. a short cycle
-that decodes to plausible bytes across sources) before trusting it, and its
-absence does not rule out a scheme this script doesn't happen to try (custom/
-proprietary schemes, or ones needing a secret key we don't have).
+round-tripping (encode the recovered message on clean targets with the same
+library, decode again, check bit accuracy and real LPIPS) before trusting it,
+and absence of a match does not rule out a scheme this script doesn't try
+(custom/proprietary schemes, or ones needing a secret key we don't have).
 
-Requires: pip install invisible-watermark blind-watermark onnxruntime
+Requires: pip install invisible-watermark blind-watermark onnxruntime trustmark
 """
 from __future__ import annotations
 
@@ -55,15 +72,8 @@ def bit_agreement(bit_lists):
     balance (fraction of 1-bits). 1.0 agreement = perfect, ~0.5 = random.
 
     A high agreement with a DEGENERATE majority (nearly all 0s or all 1s) is
-    a decode-bias artifact, not a real embedded message -- some blind
-    decoders default toward one bit value on typical natural-image
-    statistics regardless of whether any watermark of theirs is present.
-    Confirmed empirically: WM_1 vs dwtDct produced agreement=0.91 with a
-    majority string of ~95% ones (and the "recovered message" changed
-    structure between length=48 and length=100, itself a red flag) -- while
-    WM_2 vs rivaGan produced agreement=0.99 with a balanced, non-degenerate
-    32-bit string (16/32 ones) that round-trips perfectly through the real
-    encoder. Only the latter pattern is trustworthy."""
+    a decode-bias artifact, not a real embedded message -- see module
+    docstring for the confirmed WM_1/dwtDct false positive this catches."""
     if not bit_lists:
         return None, None, None
     M = np.stack(bit_lists).astype(np.int64)
@@ -71,11 +81,23 @@ def bit_agreement(bit_lists):
     return float((M == majority).mean()), majority, float(majority.mean())
 
 
+def add_result(results, category, library, method, params, bit_lists_src, bit_lists_ctrl):
+    agreement, majority, balance = bit_agreement(bit_lists_src)
+    control, _, _ = bit_agreement(bit_lists_ctrl) if bit_lists_ctrl else (None, None, None)
+    results.append({
+        "category": category, "library": library, "method": method, "params": params,
+        "agreement": agreement, "control": control, "balance": balance,
+        "majority": "".join(map(str, majority)) if majority is not None else None,
+    })
+
+
 # --------------------------------------------------------------------------
-# invisible-watermark (imwatermark): dwtDct, dwtDctSvd, rivaGan
+# invisible-watermark (imwatermark): dwtDct, dwtDctSvd, rivaGan -- default
+# parameters only. The scale/block/channel sweep for dwtDct/dwtDctSvd is
+# handled separately below (run_dct_scale_sweep).
 # --------------------------------------------------------------------------
 
-def imwatermark_decode_all(images_bgr, method, length):
+def imwatermark_decode_all(images_bgr, method, length, **configs):
     from imwatermark import WatermarkDecoder
 
     decoder = WatermarkDecoder("bits", length)
@@ -84,7 +106,7 @@ def imwatermark_decode_all(images_bgr, method, length):
     bit_lists = []
     for img in images_bgr:
         try:
-            bits = decoder.decode(img, method=method)
+            bits = decoder.decode(img, method=method, **configs)
             bit_lists.append(np.asarray(bits, dtype=np.int64))
         except Exception:
             return None
@@ -99,7 +121,8 @@ def run_imwatermark(sources_bgr, control_bgr, results, category):
     min_side = min(min(im.shape[:2]) for im in sources_bgr)
     if min_side < 256:
         print(f"  [imwatermark] {category}: images smaller than 256x256, library requires "
-              "at least that -- skipping (would need upscaling, which risks false negatives)")
+              "at least that -- skipping default-param pass (would need upscaling, which "
+              "risks false negatives)")
         return
 
     for method, length in configs:
@@ -107,13 +130,40 @@ def run_imwatermark(sources_bgr, control_bgr, results, category):
         if src_bits is None:
             continue
         ctrl_bits = imwatermark_decode_all(control_bgr, method, length)
-        agreement, majority, balance = bit_agreement(src_bits)
-        control, _, _ = bit_agreement(ctrl_bits) if ctrl_bits else (None, None, None)
-        results.append({
-            "category": category, "library": "imwatermark", "method": method, "length": length,
-            "agreement": agreement, "control": control, "balance": balance,
-            "majority": "".join(map(str, majority)) if majority is not None else None,
-        })
+        add_result(results, category, "imwatermark", method, f"len={length}", src_bits, ctrl_bits)
+
+
+# --------------------------------------------------------------------------
+# Classical scale/block/channel parameter sweep for dwtDct and dwtDctSvd.
+# --------------------------------------------------------------------------
+
+def run_dct_scale_sweep(sources_bgr, control_bgr, results, category, scale_grid, block_grid, length_grid):
+    min_side = min(min(im.shape[:2]) for im in sources_bgr)
+    if min_side < 256:
+        print(f"  [dct-sweep] {category}: images smaller than 256x256 -- skipping")
+        return
+
+    # scales index: [Y, Cb, Cr] but both methods structurally only read
+    # indices 0 (Y) and 1 (Cb) -- Cr (index 2) is always dead code.
+    channel_configs = {
+        "Cb-only": lambda s: [0, s, 0],
+        "Y-only": lambda s: [s, 0, 0],
+    }
+
+    for method in ("dwtDct", "dwtDctSvd"):
+        for channel_name, make_scales in channel_configs.items():
+            for scale in scale_grid:
+                for block in block_grid:
+                    for length in length_grid:
+                        scales = make_scales(scale)
+                        src_bits = imwatermark_decode_all(
+                            sources_bgr, method, length, scales=scales, block=block)
+                        if src_bits is None:
+                            continue
+                        ctrl_bits = imwatermark_decode_all(
+                            control_bgr, method, length, scales=scales, block=block)
+                        params = f"scale={scale} block={block} ch={channel_name} len={length}"
+                        add_result(results, category, "imwatermark", method, params, src_bits, ctrl_bits)
 
 
 # --------------------------------------------------------------------------
@@ -140,13 +190,47 @@ def run_blind_watermark(sources_bgr, control_bgr, results, category):
         if src_bits is None:
             continue
         ctrl_bits = blind_watermark_decode_all(control_bgr, length)
-        agreement, majority, balance = bit_agreement(src_bits)
-        control, _, _ = bit_agreement(ctrl_bits) if ctrl_bits else (None, None, None)
-        results.append({
-            "category": category, "library": "blind_watermark", "method": "dwt_dct_svd", "length": length,
-            "agreement": agreement, "control": control, "balance": balance,
-            "majority": "".join(map(str, majority)) if majority is not None else None,
-        })
+        add_result(results, category, "blind_watermark", "dwt_dct_svd", f"len={length}", src_bits, ctrl_bits)
+
+
+# --------------------------------------------------------------------------
+# TrustMark: deep encoder/decoder, purpose-built for content provenance.
+# Works at any resolution (resizes internally) -- no 256x256 floor, so this
+# also covers WM_5 (128x128). use_ECC=False + MODE='binary' gives raw,
+# un-corrected 100-bit output, verified to round-trip at 100% locally.
+# --------------------------------------------------------------------------
+
+def trustmark_decode_all(images_bgr, tm):
+    from PIL import Image
+
+    bit_lists = []
+    for img_bgr in images_bgr:
+        try:
+            pil_img = Image.fromarray(img_bgr[..., ::-1])  # BGR -> RGB for PIL
+            decoded, detected, _ = tm.decode(pil_img, MODE="binary")
+            if not detected:
+                return None
+            bit_lists.append(np.array([int(c) for c in decoded], dtype=np.int64))
+        except Exception:
+            return None
+    return bit_lists
+
+
+def run_trustmark(sources_bgr, control_bgr, results, category, model_types):
+    for model_type in model_types:
+        try:
+            from trustmark import TrustMark
+            tm = TrustMark(verbose=False, model_type=model_type, use_ECC=False)
+        except Exception as e:
+            print(f"  [trustmark] {category}: failed to load model_type={model_type}: {e}")
+            continue
+
+        src_bits = trustmark_decode_all(sources_bgr, tm)
+        if src_bits is None:
+            print(f"  [trustmark] {category}: model_type={model_type} did not detect a watermark on all sources")
+            continue
+        ctrl_bits = trustmark_decode_all(control_bgr, tm)
+        add_result(results, category, "trustmark", model_type, "binary/no-ECC", src_bits, ctrl_bits)
 
 
 # --------------------------------------------------------------------------
@@ -158,12 +242,23 @@ def parse_args():
     p.add_argument("--n-control", type=int, default=25, help="how many clean images to use as the negative control")
     p.add_argument("--skip-imwatermark", action="store_true")
     p.add_argument("--skip-blind-watermark", action="store_true")
+    p.add_argument("--skip-trustmark", action="store_true")
+    p.add_argument("--skip-dct-sweep", action="store_true")
+    p.add_argument("--trustmark-model-types", default="Q",
+                    help="comma-separated subset of C,Q,B,P -- each downloads its own checkpoint on first use")
+    p.add_argument("--scale-grid", default="10,20,30,36,50,75,100,150,200")
+    p.add_argument("--block-grid", default="4")
+    p.add_argument("--dct-sweep-lengths", default="32,100")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     categories = [c.strip() for c in args.categories.split(",") if c.strip()]
+    model_types = [m.strip() for m in args.trustmark_model_types.split(",") if m.strip()]
+    scale_grid = [float(v) for v in args.scale_grid.split(",")]
+    block_grid = [int(v) for v in args.block_grid.split(",")]
+    length_grid = [int(v) for v in args.dct_sweep_lengths.split(",")]
 
     src, clean = load_dataset(args.dataset)
     by_resolution = {}
@@ -179,11 +274,15 @@ def main():
 
         if not args.skip_imwatermark:
             run_imwatermark(sources_bgr, control_bgr, results, category)
+        if not args.skip_dct_sweep:
+            run_dct_scale_sweep(sources_bgr, control_bgr, results, category, scale_grid, block_grid, length_grid)
         if not args.skip_blind_watermark:
             run_blind_watermark(sources_bgr, control_bgr, results, category)
+        if not args.skip_trustmark:
+            run_trustmark(sources_bgr, control_bgr, results, category, model_types)
 
-    print(f"\n{'category':6} {'library':14} {'method':10} {'len':>4} {'agree':>7} {'control':>8} {'balance':>8}  verdict")
-    print("-" * 95)
+    print(f"\n{'category':6} {'library':14} {'method':10} {'params':30} {'agree':>7} {'control':>8} {'balance':>8}  verdict")
+    print("-" * 120)
     flagged = []
     for r in results:
         if r["agreement"] is None:
@@ -199,12 +298,12 @@ def main():
             verdict = ""
         ctrl_str = f"{r['control']:.3f}" if r["control"] is not None else "n/a"
         bal_str = f"{r['balance']:.2f}" if r["balance"] is not None else "n/a"
-        print(f"{r['category']:6} {r['library']:14} {r['method']:10} {r['length']:4} "
+        print(f"{r['category']:6} {r['library']:14} {r['method']:10} {r['params']:30} "
               f"{r['agreement']:7.3f} {ctrl_str:>8} {bal_str:>8}  {verdict}")
 
     print(f"\n{len(flagged)} possible match(es) flagged (balanced majority + high agreement + clear control gap).")
     for r in flagged:
-        print(f"  {r['category']} / {r['library']} / {r['method']} (len={r['length']}): majority bits = {r['majority']}")
+        print(f"  {r['category']} / {r['library']} / {r['method']} ({r['params']}): majority bits = {r['majority']}")
     if flagged:
         print("Confirm each by round-tripping: use the SAME library's encoder to embed this exact message")
         print("on the matching clean targets, decode again, and check both bit accuracy and real LPIPS.")

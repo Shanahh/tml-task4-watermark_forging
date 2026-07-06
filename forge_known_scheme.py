@@ -12,6 +12,14 @@ imwatermark's rivaGan method to the 32-bit message
 bits; round-trip encode-then-decode on clean targets recovers the message
 with 100% accuracy at ~0.013 mean LPIPS locally).
 
+Also confirmed: WM_7 decodes consistently under TrustMark (model_type='Q',
+use_ECC=False, MODE='binary') to the 100-bit message
+"1000100100110010100110011110110010010010111110000111011111111101011001111101011011010001010011100001"
+(agreement 1.000 vs 0.612 control, balanced). Round-trip verified: encoding
+this message with TrustMark's own encoder onto WM_7's clean targets recovers
+it with 100% bit accuracy at ~0.0016 mean LPIPS locally (Sqlt~0.987) -- even
+better than WM_2's RivaGAN result.
+
 This script is deliberately OPT-IN and EXPLICIT per category: you must name
 the scheme and paste the exact recovered message yourself after inspecting
 identify_scheme.py's output, rather than have this auto-trust a detection.
@@ -22,7 +30,8 @@ everything already tuned there instead of replacing it.
 Usage:
     python forge_known_scheme.py --dataset dataset --base-dir simple_candidates \
         --output-dir known_scheme_candidates \
-        --wm2-scheme rivaGan --wm2-message 00010000101111110011101011101000
+        --wm2-scheme rivaGan --wm2-message 00010000101111110011101011101000 \
+        --wm7-scheme trustmark --wm7-message 1000100100110010100110011110110010010010111110000111011111111101011001111101011011010001010011100001
 """
 from __future__ import annotations
 
@@ -36,7 +45,8 @@ from common import CATEGORIES, CATEGORY_RANGES, load_dataset, save_rgb
 
 IMWATERMARK_METHODS = ("dwtDct", "dwtDctSvd", "rivaGan")
 BLIND_WATERMARK_METHOD = "blind_watermark"
-SCHEME_CHOICES = ("none",) + IMWATERMARK_METHODS + (BLIND_WATERMARK_METHOD,)
+TRUSTMARK_METHOD = "trustmark"
+SCHEME_CHOICES = ("none",) + IMWATERMARK_METHODS + (BLIND_WATERMARK_METHOD, TRUSTMARK_METHOD)
 
 
 def arg_name(category, suffix):
@@ -61,6 +71,8 @@ def parse_args():
         p.add_argument(f"--{stem}-password-wm", type=int, default=1)
         p.add_argument(f"--{stem}-password-img", type=int, default=1)
         p.add_argument(f"--{stem}-block-shape", default="4,4")
+        # trustmark hyperparameters
+        p.add_argument(f"--{stem}-trustmark-model-type", default="Q", choices=["C", "Q", "B", "P"])
     return p.parse_args()
 
 
@@ -98,6 +110,19 @@ def forge_blind_watermark(clean_targets, message, password_wm, password_img, blo
     return forged
 
 
+def forge_trustmark(clean_targets, message, model_type):
+    from trustmark import TrustMark
+    from PIL import Image
+
+    tm = TrustMark(verbose=False, model_type=model_type, use_ECC=False)
+    forged = {}
+    for i, x in clean_targets.items():
+        u8 = np.clip(x * 255, 0, 255).round().astype(np.uint8)
+        encoded = tm.encode(Image.fromarray(u8), message, MODE="binary")
+        forged[i] = np.asarray(encoded, dtype=np.float32) / 255.0
+    return forged
+
+
 def main():
     args = parse_args()
     _, clean = load_dataset(args.dataset)
@@ -127,6 +152,9 @@ def main():
         if scheme in IMWATERMARK_METHODS:
             bits = bits_from_string(message)
             forged = forge_imwatermark(targets, scheme, bits)
+        elif scheme == TRUSTMARK_METHOD:
+            model_type = getattr(args, arg_name(category, "trustmark_model_type"))
+            forged = forge_trustmark(targets, message, model_type)
         else:
             password_wm = getattr(args, arg_name(category, "password_wm"))
             password_img = getattr(args, arg_name(category, "password_img"))
