@@ -27,6 +27,20 @@ Any category not given a scheme falls back to an existing candidate
 directory (e.g. simple_candidates/) unchanged -- so this composes with
 everything already tuned there instead of replacing it.
 
+SAFETY: this script writes to a temporary staging directory and only
+replaces --output-dir with it after ALL categories finish without error.
+Confirmed failure mode this prevents: an earlier run crashed partway through
+(missing `trustmark` package, categories are processed in WM_1..WM_8 order)
+after WM_1-6 had already been (re-)written in-place into a --output-dir left
+over from a prior successful run -- silently leaving WM_7/WM_8 as whatever
+STALE content was already there, with no error visible in the final zip
+(200 files still present, just not the ones you thought). The submission
+that resulted was accidentally identical to the previous one, which is why
+the score didn't move even though the identified scheme/message were correct.
+Staging + atomic replace means any crash now leaves --output-dir completely
+untouched (either absent, or exactly its last known-good state) instead of
+partially overwritten.
+
 Usage:
     python forge_known_scheme.py --dataset dataset --base-dir simple_candidates \
         --output-dir known_scheme_candidates \
@@ -36,7 +50,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import shutil
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +63,17 @@ IMWATERMARK_METHODS = ("dwtDct", "dwtDctSvd", "rivaGan")
 BLIND_WATERMARK_METHOD = "blind_watermark"
 TRUSTMARK_METHOD = "trustmark"
 SCHEME_CHOICES = ("none",) + IMWATERMARK_METHODS + (BLIND_WATERMARK_METHOD, TRUSTMARK_METHOD)
+
+REQUIRED_MODULE = {
+    "dwtDct": "imwatermark", "dwtDctSvd": "imwatermark", "rivaGan": "imwatermark",
+    BLIND_WATERMARK_METHOD: "blind_watermark",
+    TRUSTMARK_METHOD: "trustmark",
+}
+INSTALL_HINT = {
+    "imwatermark": "pip install invisible-watermark onnxruntime",
+    "blind_watermark": "pip install blind-watermark",
+    "trustmark": "pip install trustmark",
+}
 
 
 def arg_name(category, suffix):
@@ -123,11 +150,40 @@ def forge_trustmark(clean_targets, message, model_type):
     return forged
 
 
+def preflight_check(args):
+    """Verify every library needed by the requested --wmN-scheme flags is
+    importable BEFORE writing anything. Catches the confirmed failure mode
+    where a missing package (e.g. `trustmark`) crashes the script partway
+    through the category loop, silently leaving stale files from a previous
+    run in --output-dir with no visible error in the final zip."""
+    missing = {}
+    for category in CATEGORIES:
+        scheme = getattr(args, arg_name(category, "scheme"))
+        if scheme == "none":
+            continue
+        module_name = REQUIRED_MODULE[scheme]
+        try:
+            importlib.import_module(module_name)
+        except ImportError:
+            missing.setdefault(module_name, []).append(category)
+
+    if missing:
+        lines = ["Missing dependencies for the requested schemes -- nothing has been written:"]
+        for module_name, categories in missing.items():
+            lines.append(f"  {module_name} (needed for {', '.join(categories)}): {INSTALL_HINT[module_name]}")
+        raise SystemExit("\n".join(lines))
+
+
 def main():
     args = parse_args()
+    preflight_check(args)
+
     _, clean = load_dataset(args.dataset)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # Write to a temp staging directory and only replace --output-dir with it
+    # once every category has finished without error -- see module docstring
+    # ("SAFETY") for the exact incident this prevents.
+    staging_dir = Path(tempfile.mkdtemp(prefix="forge_known_scheme_"))
 
     for category in CATEGORIES:
         stem = category.lower().replace("_", "")
@@ -138,14 +194,15 @@ def main():
         if scheme == "none":
             for i in ids:
                 if args.base_dir is not None and (args.base_dir / f"{i}.png").exists():
-                    shutil.copy2(args.base_dir / f"{i}.png", args.output_dir / f"{i}.png")
+                    shutil.copy2(args.base_dir / f"{i}.png", staging_dir / f"{i}.png")
                 else:
-                    save_rgb(clean[i], args.output_dir / f"{i}.png")
+                    save_rgb(clean[i], staging_dir / f"{i}.png")
             print(f"{category}: passthrough ({'base-dir' if args.base_dir else 'clean'})")
             continue
 
         message = getattr(args, arg_name(category, "message"))
         if message is None:
+            shutil.rmtree(staging_dir, ignore_errors=True)
             raise SystemExit(f"--{stem}-message is required when --{stem}-scheme={scheme}")
 
         targets = {i: clean[i] for i in ids}
@@ -162,8 +219,13 @@ def main():
             forged = forge_blind_watermark(targets, message, password_wm, password_img, block_shape)
 
         for i, y in forged.items():
-            save_rgb(y, args.output_dir / f"{i}.png")
+            save_rgb(y, staging_dir / f"{i}.png")
         print(f"{category}: forged with {scheme} (message={message})")
+
+    # All 200 files written successfully to staging -- now atomically swap.
+    if args.output_dir.exists():
+        shutil.rmtree(args.output_dir)
+    shutil.move(str(staging_dir), str(args.output_dir))
 
     print("saved", args.output_dir)
 
