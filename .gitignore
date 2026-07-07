@@ -24,3 +24,6 @@ report/*.log
 report/*.out
 report/*.bbl
 report/*.blg
+
+# macOS
+.DS_Store

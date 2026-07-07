@@ -101,8 +101,7 @@ from pathlib import Path
 
 import numpy as np
 
-from common import CATEGORIES, load_dataset, save_rgb, category_for_id
-from forge_specialized import estimate_content
+from common import CATEGORIES, load_dataset, save_rgb, category_for_id, estimate_content
 
 EXTRACTION_CHOICES = ("raw", "denoise", "wmcopier", "regen")
 

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, median_filter
 
 CATEGORIES = [f"WM_{i}" for i in range(1, 9)]
 
@@ -124,3 +124,37 @@ def category_for_id(i: int) -> str:
         if lo <= i <= hi:
             return c
     raise ValueError(i)
+
+
+def _wavelet_denoise(channel, wavelet="db4", level=3):
+    """Wavelet BayesShrink denoiser used by the 'denoiser' content estimate."""
+    import pywt
+
+    coeffs = pywt.wavedec2(channel, wavelet, level=level, mode="periodization")
+    finest = coeffs[-1][-1]
+    sigma = np.median(np.abs(finest)) / 0.6745  # robust noise std (MAD)
+    out = [coeffs[0]]
+    for details in coeffs[1:]:
+        thresholded = []
+        for d in details:
+            var = np.var(d)
+            sigma_x = np.sqrt(max(var - sigma ** 2, 1e-12))
+            thresh = sigma ** 2 / sigma_x  # BayesShrink, per subband
+            thresholded.append(pywt.threshold(d, thresh, mode="soft"))
+        out.append(tuple(thresholded))
+    denoised = pywt.waverec2(out, wavelet, mode="periodization")
+    return denoised[: channel.shape[0], : channel.shape[1]]
+
+
+def estimate_content(channel, method):
+    """Estimate the clean content of a single channel, for residual extraction.
+    'highpass' = gaussian blur; 'denoiser' = wavelet BayesShrink (median-filter
+    fallback if PyWavelets is unavailable)."""
+    if method == "highpass":
+        return gaussian_filter(channel, 1.5, mode="reflect")
+    if method == "denoiser":
+        try:
+            return _wavelet_denoise(channel)
+        except ImportError:
+            return median_filter(channel, size=3, mode="reflect")
+    raise ValueError(method)
