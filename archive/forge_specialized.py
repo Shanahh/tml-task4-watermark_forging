@@ -1,49 +1,3 @@
-#!/usr/bin/env python3
-"""Hand-crafted, non-neural forging attacks for the watermark groups that show
-a validated, domain-specific statistical signal in diagnose_watermarks_validated.py:
-
-    WM_1  Cb-channel high-pass residual template
-    WM_3  combined Y/Cb/Cr high-pass residual templates (all three channels
-          show strong, independent evidence -- Y_auc/Cb_auc/Cr_auc all
-          ~0.97-0.99 -- so this sidesteps the surrogate+PGD transferability
-          question entirely for this category, the same way WM_1's Cb
-          template does for its one strong channel)
-    WM_4  coherent Fourier-phase template
-    WM_5  Cb/Cr residual template *and* Cb/Cr LSB bit-plane copy (combined,
-          since both domains show independent, significant evidence and the
-          LSB edit costs essentially no extra perceptual budget)
-    WM_6  block-DCT coefficient distribution matching
-
-WM_3 also has a surrogate-classifier + PGD path (train_surrogate.py /
-forge_pgd.py) kept around for ablation comparison, but the hand-crafted
-attack here is the default routing choice since it doesn't depend on a
-black-box proxy model's transferability to the real detector.
-
-WM_2, WM_7, WM_8 are left untouched here; they are handled by the
-surrogate-classifier + PGD pipeline only, since they show no validated
-hand-crafted signal at all.
-
-Strength is per-category (and per-channel for WM_3), and the defaults are
-amplitude-CALIBRATED, not chosen for maximum perceptual budget. calibrate_
-strength.py measures the genuine watermark's own amplitude from the 25
-sources (by projecting each source's residual onto the extracted template)
-and the default strengths below reproduce that amplitude, so the forgery is
-"as watermarked as a genuine source" rather than as strong as the LPIPS
-budget allows. This matters because overshooting the genuine amplitude puts
-the forgery outside the distribution of real watermarked images -- which can
-lower the real decoder's bit accuracy (Sdet) AND costs Sqlt, a double loss.
-An earlier LPIPS-budget-driven sweep (sweep_lpips_strength.py) is still
-useful for seeing where quality collapses, but the genuine amplitude, not
-the quality knee, is the correct strength target. Re-run calibrate_strength.py
-and update the defaults if the templates change.
-
-WM_3's three channels have different genuine amplitudes (Y is ~4.6x Cb/Cr),
-so it takes three separate strengths (--wm3-y/cb/cr-strength) instead of one.
-
-This script produces exactly one candidate set per invocation (no more
-strength_<value> subfolders) -- if you want to compare strength choices,
-run it multiple times with different --output-dir values.
-"""
 from __future__ import annotations
 
 import argparse
@@ -54,30 +8,6 @@ from scipy.fft import dctn, idctn
 from scipy.ndimage import gaussian_filter, median_filter
 
 from common import EPS, grayscale, load_dataset, rgb_to_ycbcr, save_rgb, ycbcr_to_rgb
-
-
-# --------------------------------------------------------------------------
-# Content estimation for residual extraction.
-#
-# The channel-residual attacks recover the watermark as (channel - estimated
-# clean content). How the clean content is estimated determines how cleanly
-# the watermark is isolated:
-#
-#   "highpass" (default): clean ~ gaussian-blurred channel. Cheap, but it
-#       keeps sharp edges/texture (high-frequency *content*) in the residual,
-#       leaking content into the template, and discards any low-frequency
-#       watermark component.
-#   "denoiser": clean ~ a proper edge-preserving denoiser. For a noise-like
-#       (spread-spectrum) watermark this isolates delta far better, because the
-#       denoiser removes the noise-like watermark across all bands while
-#       preserving content (edges/texture) -- i.e. the residual is the
-#       watermark, not the content. This is the classic Watermark Copy Attack
-#       (Kutter et al.) estimator. Wavelet (BayesShrink) when PyWavelets is
-#       available, scipy median-filter fallback otherwise.
-#
-# This is opt-in via --extraction; the default preserves the prior behavior
-# exactly, so an existing calibrated run is unchanged.
-# --------------------------------------------------------------------------
 
 EXTRACTION_METHODS = ("highpass", "denoiser")
 
@@ -108,9 +38,6 @@ def estimate_content(channel, method):
         try:
             return _wavelet_denoise(channel)
         except ImportError:
-            # scipy-only fallback: median filter is edge-preserving and needs
-            # no extra dependency. Less ideal than wavelet for spread-spectrum
-            # watermarks but still far better than a gaussian blur.
             return median_filter(channel, size=3, mode="reflect")
     raise ValueError(method)
 
@@ -119,26 +46,14 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, default=Path("specialized_candidates"))
-    # Defaults are the amplitude-calibrated strengths from calibrate_strength.py:
-    # the strength at which the forgery's projection onto the watermark template
-    # matches the genuine watermark's own projection, measured from the 25
-    # sources. This reproduces the real watermark amplitude rather than
-    # maximizing within an LPIPS budget -- overshooting puts the forgery outside
-    # the genuine watermark distribution (hurting Sdet) and costs Sqlt. Re-run
-    # calibrate_strength.py and update these if the templates change.
-    p.add_argument("--wm1-strength", type=float, default=0.0024)
-    # WM_3's three channels have different genuine amplitudes (Y ~4.6x Cb/Cr),
-    # so they get separate strengths rather than one shared value.
-    p.add_argument("--wm3-y-strength", type=float, default=0.0079)
-    p.add_argument("--wm3-cb-strength", type=float, default=0.0017)
-    p.add_argument("--wm3-cr-strength", type=float, default=0.0017)
-    p.add_argument("--wm4-strength", type=float, default=0.0091)
-    p.add_argument("--wm5-strength", type=float, default=0.0071)
-    # WM_6 is distribution-matched, not amplitude-additive: its interpolation
-    # factor saturates at strength>=0.04 (full match to the source DCT
-    # distribution), so this is left at the saturation point, not calibrated.
+    p.add_argument("--wm1-strength", type=float, default=0.002)
+    p.add_argument("--wm3-y-strength", type=float, default=0.007)
+    p.add_argument("--wm3-cb-strength", type=float, default=0.001)
+    p.add_argument("--wm3-cr-strength", type=float, default=0.001)
+    p.add_argument("--wm4-strength", type=float, default=0.009)
+    p.add_argument("--wm5-strength", type=float, default=0.007)
     p.add_argument("--wm6-strength", type=float, default=0.04)
-    p.add_argument("--wm4-threshold", type=float, default=0.45)
+    p.add_argument("--wm4-threshold", type=float, default=0.4)
     p.add_argument("--wm6-coeff-count", type=int, default=8)
     p.add_argument(
         "--extraction",
@@ -146,9 +61,7 @@ def parse_args():
         choices=EXTRACTION_METHODS,
         help="how the channel-residual attacks (WM_1/3/5) estimate clean content. "
         "'highpass' is the default and preserves prior behavior; 'denoiser' is "
-        "opt-in and isolates spread-spectrum watermarks more cleanly. NOTE: the "
-        "calibrated default strengths were derived for 'highpass' -- re-run "
-        "calibrate_strength.py --extraction denoiser and pass the new strengths.",
+        "opt-in and isolates spread-spectrum watermarks more cleanly.",
     )
     p.add_argument(
         "--block-match-strength",
@@ -158,16 +71,11 @@ def parse_args():
         "block-distribution matching (see apply_block_match) on top of the global "
         "template for WM_1/3/4. score_with_diagnostics.py showed amplitude-calibrated "
         "global templates only weakly reproduce the genuine watermark's block-level "
-        "signature; this targets that directly. Try 1.0 (full transplant) first.",
+        "signature",
     )
     p.add_argument("--block-match-grid", type=int, default=8)
     return p.parse_args()
 
-
-# --------------------------------------------------------------------------
-# WM_1, WM_3, WM_5: channel residual templates (content estimated per
-# --extraction; see estimate_content above).
-# --------------------------------------------------------------------------
 
 def channel_residual(x, ch, method="highpass"):
     c = rgb_to_ycbcr(x)[..., ch]
@@ -185,24 +93,6 @@ def apply_channel(x, template, ch, strength):
     y[..., ch] = np.clip(y[..., ch] + strength * template, 0, 1)
     return ycbcr_to_rgb(y)
 
-
-# --------------------------------------------------------------------------
-# Block-distribution matching (opt-in, --block-match-strength > 0).
-#
-# score_with_diagnostics.py showed that amplitude-calibrating a single GLOBAL
-# scalar projection of the channel template (above) only weakly reproduces
-# the genuine watermark's signature under the richer classifier features
-# (8x8 block-mean residual stats) that originally justified each attack --
-# even though the global projection itself matches by construction. Matching
-# one coarse number doesn't guarantee the full spatial distribution lands.
-#
-# This generalizes WM_6's apply_dct (which matches the full per-coefficient
-# DCT distribution, not a scalar) to the spatial domain: for each cell of an
-# 8x8 grid over the channel residual, shift that cell's mean from where it
-# sits in the clean-negative distribution to the equivalent position in the
-# genuine-source distribution (z-score transplant, same mechanism as
-# apply_dct). This is additive on top of the existing global template.
-# --------------------------------------------------------------------------
 
 def block_grid_means(residual, grid=8):
     h, w = residual.shape
@@ -225,9 +115,6 @@ def expand_grid(values, ys, xs, shape):
 
 
 def block_match_stats(xs, ch, method, grid=8):
-    """Per-cell mean/std of the channel residual's block means, across a set
-    of images (sources for the genuine-watermark target, same-resolution
-    clean images for the baseline)."""
     cell_means = [block_grid_means(channel_residual(x, ch, method), grid)[0] for x in xs]
     stacked = np.stack(cell_means)
     return stacked.mean(0), stacked.std(0) + EPS
@@ -266,19 +153,6 @@ def lsb_template(xs, ch):
 
 
 def apply_lsb(x, template, ch, max_delta=6):
-    """Set the LSB of the saved Cb/Cr byte to `template`, exactly, after the
-    PNG save/reload round trip.
-
-    Setting the bit on the *derived* floating-point YCbCr value and
-    converting back to RGB does NOT work: save_rgb rounds the resulting RGB
-    to uint8 for the PNG, and re-deriving YCbCr from that rounded RGB after
-    reload essentially never reproduces the intended Cb/Cr byte exactly
-    (confirmed empirically: 100% bit mismatch in practice). Cb is dominated
-    by the Blue channel (weight 0.5) and Cr by the Red channel (weight 0.5),
-    so instead this perturbs only that one RGB channel, by the smallest
-    integer delta, until the resulting Cb/Cr byte -- computed exactly as it
-    will be after the uint8 RGB round trip -- has the desired LSB.
-    """
     assert ch in (1, 2)
     driver = 2 if ch == 1 else 0  # Cb <- Blue, Cr <- Red
 
@@ -313,16 +187,6 @@ def apply_lsb(x, template, ch, max_delta=6):
 
 
 def apply_lsb_pair(x, cb_template, cr_template, max_delta=4):
-    """Set both the Cb and Cr LSBs at once, exactly, after the PNG round trip.
-
-    Calling apply_lsb() twice in sequence (once per channel) does NOT work:
-    fixing Cr nudges the Red channel, but Cb's formula has a non-zero Red
-    coefficient (-0.168736), so that nudge can flip the Cb bit that was just
-    set (confirmed empirically: ~9% mismatch on the combined attack output,
-    vs <0.3% for either channel fixed in isolation). This solves for a joint
-    (delta_red, delta_blue) pair per pixel that satisfies both bits at once,
-    smallest combined magnitude first, instead of fixing them independently.
-    """
     rgb_u8 = np.clip(np.round(x * 255), 0, 255).astype(np.int16)
     r0, g0, b0 = (rgb_u8[..., 0].astype(np.float64), rgb_u8[..., 1].astype(np.float64),
                   rgb_u8[..., 2].astype(np.float64))
@@ -475,8 +339,6 @@ def main():
         f"block_match_strength={args.block_match_strength}"
     )
 
-    # Block-distribution matching is opt-in (default strength 0 = skipped
-    # entirely, so the default path's cost and output are unchanged).
     block_stats = {}
     if args.block_match_strength > 0:
         grid = args.block_match_grid

@@ -1,20 +1,3 @@
-#!/usr/bin/env python3
-"""Sweep BM3D's sigma_psd for the 'regen' extraction and report watermark
-residual CONSISTENCY per value, so you can pick sigma locally instead of
-guessing across leaderboard submission cooldowns.
-
-Consistency = ||mean(residuals)||^2 / mean(||residual||^2) across the 25
-sources of a category. This is a local proxy for "how cleanly does a fixed
-watermark isolate" -- higher means the per-source residuals agree with each
-other more (less content noise, more shared watermark), not a guarantee about
-real bit-accuracy, but it's exactly the measurement that showed regen beats
-raw averaging for WM_5/WM_6 in the first place.
-
-Usage:
-    pip install bm3d
-    python sweep_regen_sigma.py --dataset dataset --categories WM_5,WM_6 \
-        --sigma-grid 0.0025,0.005,0.01,0.015,0.02,0.03,0.04
-"""
 from __future__ import annotations
 
 import argparse

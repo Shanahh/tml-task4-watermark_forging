@@ -1,47 +1,3 @@
-#!/usr/bin/env python3
-"""Score our own forged candidates with the SAME full out-of-fold-style
-feature classifiers used by diagnose_watermarks_validated.py, instead of
-trusting calibrate_strength.py's single linear-projection proxy.
-
-Why this exists
-----------------
-Amplitude calibration matched the genuine watermark's projection onto a
-single extracted direction. Two independent extraction methods (highpass,
-denoiser), both amplitude-calibrated, failed to improve the real leaderboard
-score. That is consistent with two very different explanations:
-
-  (a) a bug in the forging pipeline -- the perturbation looks right under the
-      simple linear-projection model but isn't actually landing as intended
-      (the same class of bug as the WM_5 LSB save issue found earlier), or
-  (b) the high diagnostic AUC for these categories reflects a real, but
-      non-message, statistical difference between the 25 sources and the
-      clean targets (shared resize/compression/generation provenance) rather
-      than the actual embedded watermark -- in which case no amount of
-      amplitude/direction tuning of THIS feature family will ever decode,
-      because it was never the message to begin with.
-
-This script distinguishes them, for free, with no submission needed: it
-trains the richer feature-based classifiers (block-mean residual, per-channel
-high-pass, LSB bit-plane stats, block-DCT coefficient stats -- the same
-families diagnose_watermarks_validated.py used to justify each attack) on
-the real positives/negatives, then scores our OWN forged candidates with them.
-
-  - If forged images do NOT score meaningfully higher than the matching clean
-    images under our own classifier: the forging pipeline likely has an
-    implementation bug (situation a) -- investigate before concluding the
-    model is wrong.
-  - If forged images DO score confidently as "watermarked" under our own
-    classifier, and the real leaderboard still doesn't respond: this is
-    strong evidence the feature family is keying on a confound, not the
-    embedded message (situation b) -- the linear/hand-crafted approach is
-    likely a dead end for that category; pivot to surrogate+PGD (which
-    learns a direction rather than assuming one) the same way already done
-    for WM_2/7/8.
-
-Negatives used for training exclude the category's own 25 target ids, so the
-classifier never sees the *exact* clean image (pre-forgery) it's about to be
-asked to score (post-forgery) as a training negative.
-"""
 from __future__ import annotations
 
 import argparse
@@ -92,11 +48,7 @@ def main():
         resolution = pos[0].shape[:2]
         neg = [im for i, im in by_resolution[resolution] if not (lo <= i <= hi)]
         if not neg:
-            # e.g. WM_5 is 128x128 and its own 25 ids are the ONLY clean
-            # images at that resolution -- fall back to including them
-            # rather than skip the category (mild leakage, unavoidable here).
-            print(f"{category}: no negatives at resolution {resolution} excluding its own "
-                  "ids -- falling back to including them (only source of negatives at this size)")
+            print(f"{category}: no negatives at resolution {resolution} excluding its own ids")
             neg = [im for i, im in by_resolution[resolution]]
 
         clean_targets = {i: clean[i] for i in range(lo, hi + 1)}
@@ -140,15 +92,13 @@ def main():
         if best["lift"] > 0.2 and best["forged_prob"] > 0.5:
             summary = (f"registers strongly via {best['feature']} "
                        f"(clean={best['clean_prob']:.2f} -> forged={best['forged_prob']:.2f}) "
-                       "-- likely a forging-pipeline bug if leaderboard still doesn't respond, "
-                       "since our own classifier IS fooled")
+                       "-- likely a forging-pipeline bug")
         elif best["lift"] > 0.05:
             summary = (f"registers only weakly (best: {best['feature']}, lift={best['lift']:.3f}) "
-                       "-- ambiguous, worth investigating further")
+                       "-- ambiguous")
         else:
-            summary = ("DOES NOT REGISTER on any feature -- the forging pipeline itself may be "
-                       "broken (check this first), OR even our own classifier can't be fooled, "
-                       "which would be a stronger forging-bug signal than a confound explanation")
+            summary = ("DOES NOT REGISTER on any feature -- the forging pipeline may be "
+                       "broken, OR even own classifier can't be fooled, ")
         print(f"  {category}: {summary}")
 
 

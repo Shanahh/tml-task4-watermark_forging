@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""Train an ensemble of watermarked-vs-clean residual classifiers for one
-watermark category. Used as the surrogate detector that forge_pgd.py attacks
-with constrained PGD for categories with no validated hand-crafted signal
-(WM_2, WM_3, WM_7, WM_8).
-
-Three distinct architectures (--arch cnn_a / cnn_b / cnn_c) are provided.
-cnn_a is the default single-architecture attack target for forge_pgd.py.
-forge_pgd.py can also attack cnn_a and cnn_b *together* as an ensemble (the
-standard transferability trick: optimizing against diverse models at once
-generalizes better to a third, unseen model than optimizing against one).
-cnn_c is then available as a truly independent holdout for
-check_surrogate_transfer.py to judge that ensemble attack against, since
-cnn_a/cnn_b are no longer independent of the attack once both are used.
-"""
 from __future__ import annotations
 
 import argparse
@@ -43,7 +28,6 @@ class ResidualDataset(Dataset):
 
 
 class ResidualCNN(nn.Module):
-    """Default architecture: 5 conv layers, two stride-2 downsamples."""
 
     def __init__(self):
         super().__init__()
@@ -70,9 +54,6 @@ class ResidualCNN(nn.Module):
 
 
 class ResidualCNNAlt(nn.Module):
-    """Structurally different architecture (larger kernels, one downsample,
-    different channel widths) used to build an independent surrogate for
-    transfer sanity-checking, not as the primary attack model."""
 
     def __init__(self):
         super().__init__()
@@ -97,10 +78,6 @@ class ResidualCNNAlt(nn.Module):
 
 
 class ResidualCNNWide(nn.Module):
-    """Third architecture: shallow and wide, GroupNorm instead of BatchNorm,
-    a single downsample. Used as a third source of architectural diversity --
-    either as the independent holdout for an ensemble (cnn_a+cnn_b) attack,
-    or as a third member if the attack ensemble is widened further."""
 
     def __init__(self):
         super().__init__()
@@ -145,8 +122,6 @@ def parse_args():
 
 def main():
     args = parse_args()
-    # Nested by architecture so independent ensembles (e.g. cnn_a vs cnn_b)
-    # for the same category never overwrite each other's checkpoints.
     out_dir = args.output_dir / args.category.lower() / args.arch
     out_dir.mkdir(parents=True, exist_ok=True)
 

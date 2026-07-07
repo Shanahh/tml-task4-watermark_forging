@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""Generate the two figures used in the report, from the measured diagnostics
-and leaderboard results gathered during the assignment. All numbers are the
-actual values produced by diagnose_watermarks_validated.py, the BM3D
-copy-consistency analysis, identify_scheme.py, and the public leaderboard."""
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt

@@ -1,20 +1,3 @@
-#!/usr/bin/env python3
-"""Validated, out-of-fold diagnostics for the 8 unknown watermark groups.
-
-For each category, trains small logistic-regression detectors (out-of-fold,
-so reported AUCs are not inflated by overfitting) on several feature families
-(raw residual, per-channel residual, LSB bit-planes, block-DCT coefficients),
-runs permutation significance tests, checks robustness to common image
-transforms, and builds a cross-category specificity matrix.
-
-A feature should only be treated as a usable attack target when:
-  1. its out-of-fold AUC is high;
-  2. its permutation p-value is low;
-  3. the intended category scores higher than clean images;
-  4. the intended category scores higher than other watermark groups;
-  5. the signal survives a PNG decode-and-save round trip;
-  6. the signal is not explained by raw image content.
-"""
 from __future__ import annotations
 
 import argparse

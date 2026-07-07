@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""Deprecated thin wrapper: use `train_surrogate.py --category WM_3` directly."""
 from __future__ import annotations
 
 import sys

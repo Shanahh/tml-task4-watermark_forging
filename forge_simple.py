@@ -1,99 +1,3 @@
-#!/usr/bin/env python3
-"""The simplest possible forging approach: raw mean-difference templates.
-
-No high-pass filtering, no YCbCr/channel decomposition, no per-channel
-calibration, no denoiser, no block statistics -- just "Can Simple Averaging
-Defeat Modern Watermarks?" (Yang et al., NeurIPS 2024) applied literally in
-the forging direction, with no embellishment:
-
-    delta   = mean(25 source images of category k)  -  mean(clean images at
-              the same resolution)
-    forged  = clean_target + s * delta
-
-Averaging cancels each source's differing content, leaving (an estimate of)
-the one thing they all share: the watermark itself. Applied identically to
-ALL 8 categories via the exact WM_k -> clean-image-id mapping from the
-assignment (common.CATEGORY_RANGES / category_for_id) -- including WM_2/7/8,
-which earlier high-pass-based diagnostics found nothing in, but that
-assumption (the watermark being a high-frequency residual) was never itself
-validated.
-
-This exists to test that assumption directly: every other attack in this
-repo high-pass filters before averaging. If raw averaging does no better
-than 0.22, the high-pass assumption probably isn't the problem. If it does
-the same or better with far less machinery, it's the floor everything else
-should have been validated against.
-
-Validated on the leaderboard: a single shared strength took the score from
-0.22 -> 0.265 (s=0.3) -> 0.295 (s=0.5), then plateaued at s=0.6. Strength is
-now per-category (--wm1-strength ... --wm8-strength, still nothing else
-added) since the 8 watermarks are independent and likely have different real
-embedding strengths, so a single shared value is necessarily a compromise --
-the same lesson learned with the calibrated specialized pipeline, reapplied
-here without bringing back any of that pipeline's other machinery. Defaults
-are all 0.5 (the best uniform value found so far), so running with no
-overrides reproduces that submission exactly.
-
-Per-category delta EXTRACTION (--wmN-extraction, default raw):
-
-    raw       delta = mean(sources) - mean(clean_pool)          [default]
-    denoise   delta = mean over sources of [source - wavelet_denoise(source)]
-    regen     same, but with a STRONG denoiser (BM3D) -- the copy attack
-    wmcopier  raw delta with the clean-image content subspace projected out
-
-All non-raw variants are rescaled to the raw delta's per-category RMS, so the
-strength range is identical and raw-vs-X is a clean single-variable
-comparison: same perturbation amplitude, only the DIRECTION differs.
-
-'regen' is the regeneration/copy attack: remove each source's content with
-BM3D (a strong denoiser) and average the residuals, giving a clean watermark
-with no foreign-pool content-bias. Measured watermark-consistency across
-sources (||mean residual||^2 / mean ||residual||^2) shows this is a 3-4x
-cleaner watermark than raw averaging for the copyable groups WM_5 (0.13->0.39)
-and WM_6 (0.09->0.31), a weak win for WM_4, and NO help for WM_1/2/3/7/8
-(their residual is not consistent under any denoiser -- content-adaptive or
-semantic watermarks with no fixed pattern to copy; WM_3 is actually best with
-raw). So regen is a targeted win for the additive groups, not a universal
-fix. Needs `pip install bm3d`. Tune --wmN-regen-sigma (BM3D noise std, default
-0.02; ~watermark amplitude to keep).
-
-'denoise' removes each source's OWN content (wavelet Watermark-Copy-Attack
-extractor) before averaging, dropping the content-bias term (mean-content-of-
-sources minus mean-content-of-pool, which does not fully cancel with 25
-sources). NOT the high-pass mistake -- a denoiser keeps the noise-like
-watermark and removes content, the opposite selectivity from high-pass.
-
-'wmcopier' is a FEASIBLE LINEAR ADAPTATION of WMCopier (Dong et al., NeurIPS
-2025), NOT the paper's diffusion method. The real WMCopier trains an
-unconditional diffusion model on a large self-generated watermarked dataset
-to separate watermark from content -- infeasible here (black-box, 25 samples,
-no watermark encoder). Its core idea, though, is separating the watermark
-from image content. This does that linearly: the raw delta = watermark +
-content-bias, where the content-bias lies in the subspace of natural-image
-variation. We estimate that subspace as the top-k principal components of the
-clean-image pool and project it out of the delta, leaving the part orthogonal
-to content (more likely the watermark). Hyperparameter --wmN-components (k,
-default 8) trades bias (small k leaves content-bias in) against variance
-(large k also removes any watermark energy that overlaps content directions).
-k=0 reduces to the raw delta. Best suited to the content-contaminated groups
-(those that wanted LOW strength in the raw sweep, e.g. wm4/wm8), and wm1
-(flat to strength = direction, not magnitude, is the limit).
-
-Opt-in per category; default raw reproduces the tuned result.
-
-Per-category LPIPS CAP (--wmN-lpips-cap, default 0 = off = fixed strength):
-
-Instead of one fixed strength for all 25 images in a group, cap mode gives
-each image the LARGEST strength that keeps its LPIPS under the cap -- so every
-image ends at the same quality Sqlt = exp(-8*cap) but the maximum detection
-strength it can afford. This is a strictly better allocation of a fixed
-quality budget than a single group strength (more watermark on images that
-tolerate it, less on those that don't), which directly targets the score
-mean(Sdet*Sqlt). The per-image strength is found by binary search in
-[0, --max-strength]; the group's --wmN-strength is ignored when its cap > 0.
-A good starting cap for a group is the LPIPS its best fixed strength was
-already producing -- run with --report-lpips to print that per group.
-"""
 from __future__ import annotations
 
 import argparse
@@ -153,9 +57,6 @@ def load_lpips(net_name):
 
 
 def cap_strength(x, delta, cap, max_strength, lpips_distance, iters=12):
-    """Largest strength s in [0, max_strength] with LPIPS(x, clip(x+s*delta))
-    <= cap, by binary search. If even max_strength stays under the cap (delta
-    too weak to reach it), returns max_strength."""
     if lpips_distance(x, np.clip(x + max_strength * delta, 0, 1)) <= cap:
         return max_strength
     lo, hi = 0.0, max_strength
@@ -186,15 +87,7 @@ def denoise_delta(sources):
 
 def regen_delta(sources, sigma):
     """Regeneration/copy-attack extraction: source - denoise(source) averaged,
-    but with a STRONG denoiser (BM3D) instead of the weak wavelet. BM3D removes
-    each source's content while leaving the watermark in the residual, so with
-    no foreign-pool content-bias term the averaged residual is a much cleaner
-    watermark for content-independent (additive) watermarks. Verified to
-    isolate a 3-4x more consistent watermark than raw averaging for the
-    copyable groups (WM_5, WM_6); does nothing for content-adaptive/semantic
-    groups (WM_1/2/7/8), whose per-source residual is not consistent under any
-    denoiser. `sigma` is BM3D's noise std -- roughly the watermark amplitude to
-    preserve in the residual."""
+    but with a STRONG denoiser (BM3D) instead of the weak wavelet."""
     try:
         import bm3d
     except ImportError as e:
@@ -214,10 +107,6 @@ def wmcopier_delta(sources, clean_pool, n_components):
     directions of the clean-image pool (the natural-image-content subspace
     that the content-bias term lives in), keeping the part orthogonal to
     content. n_components=0 returns the raw delta unchanged.
-
-    The clean-pool PCs are computed via the Gram trick (eigendecomposition of
-    the small N x N covariance of the flattened, mean-centered clean images),
-    so this is cheap even at full image resolution.
     """
     delta = raw_delta(sources, clean_pool)
     if n_components <= 0:

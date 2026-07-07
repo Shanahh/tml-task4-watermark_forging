@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""Sanity-check a submission zip: for each category, report the mean/max
-pixel difference against the matching clean target. A category showing
-~0 diff almost certainly means it silently fell back to the clean image
-(e.g. a stale routing.json pointing at a path that no longer exists)."""
 from __future__ import annotations
 
 import argparse

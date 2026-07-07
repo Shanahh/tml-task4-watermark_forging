@@ -1,24 +1,3 @@
-#!/usr/bin/env python3
-"""Surrogate-classifier + constrained PGD forging attack.
-
-Used for watermark categories with no validated hand-crafted statistical
-signal (WM_2, WM_3, WM_7, WM_8): a small ensemble of residual classifiers
-(trained by train_surrogate.py) stands in for the unknown real detector, and
-each clean target is perturbed within an L_inf budget to maximize the
-ensemble's "watermarked" logit while staying perceptually close to the
-original.
-
---archs accepts a comma-separated list (e.g. "cnn_a,cnn_b") to attack several
-structurally different architectures simultaneously. This is the standard
-transferability trick: a perturbation that fools a diverse set of models at
-once tends to generalize to an unseen model far better than one optimized
-against a single architecture. See check_surrogate_transfer.py to validate
-this against a held-out architecture not included in --archs.
-
-The quality term optimizes real LPIPS directly (Sqlt = exp(-8*LPIPS) is the
-actual scoring function), falling back to an MSE+TV proxy if the `lpips`
-package is not installed.
-"""
 from __future__ import annotations
 
 import argparse
@@ -44,9 +23,9 @@ def parse_args():
         f"(available: {','.join(ARCHITECTURES)})",
     )
     p.add_argument("--output-dir", type=Path, default=Path("pgd_candidates"))
-    p.add_argument("--eps-grid", default="0.0039215686,0.0078431373,0.011764706")
+    p.add_argument("--eps-grid", default="0.004,0.008,0.01")
     p.add_argument("--steps", type=int, default=50)
-    p.add_argument("--step-size", type=float, default=0.0009803922)
+    p.add_argument("--step-size", type=float, default=0.001)
     p.add_argument("--lpips-net", default="alex", choices=["alex", "vgg"])
     p.add_argument("--lpips-weight", type=float, default=10.0)
     p.add_argument("--mse-weight", type=float, default=10.0)
@@ -70,8 +49,6 @@ def total_variation(d):
 def load_models(model_dir, arch, device):
     models = []
     for path in sorted(model_dir.glob("detector_*.pt")):
-        # weights_only=False: these checkpoints are written by train_surrogate.py
-        # in this repo, never loaded from an untrusted source.
         checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         model = build_model(arch).to(device)
         model.load_state_dict(checkpoint["state_dict"])
@@ -85,9 +62,6 @@ def load_models(model_dir, arch, device):
 
 
 def load_ensemble(models_root, category, archs, device):
-    """Load and concatenate the detector ensembles for every architecture in
-    `archs` (e.g. ["cnn_a", "cnn_b"]) into a single flat list of models, all
-    of which optimize() will average logits over."""
     models = []
     for arch in archs:
         models += load_models(models_root / category.lower() / arch, arch, device)

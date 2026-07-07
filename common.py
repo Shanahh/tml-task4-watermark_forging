@@ -1,5 +1,3 @@
-"""Shared dataset I/O, color-space, and small image-processing helpers used
-across the diagnostics and forging scripts."""
 from __future__ import annotations
 
 import io

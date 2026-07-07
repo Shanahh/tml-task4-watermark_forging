@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""Verify that the WM_5 LSB attack actually reproduces its intended bit
-pattern after a real PNG save/reload, instead of just trusting the
-in-memory computation.
-
-This check exists because of a real bug found in practice: an earlier
-version of apply_lsb() set the bit on the *derived floating-point* Cb/Cr
-value and converted back to RGB. save_rgb() then rounds that RGB to uint8
-for the PNG, and re-deriving Cb/Cr from the rounded RGB after reload does
-not reproduce the intended byte -- empirically, 100% of bits were lost this
-way. apply_lsb() now works directly in the persisted integer RGB domain
-instead, but this script exists so that regressions (or similar bugs in
-other channel-domain attacks) get caught automatically rather than silently
-capping the real submission score the way this one did.
-"""
 from __future__ import annotations
 
 import argparse
@@ -83,7 +68,7 @@ def main():
     threshold = 0.01
     if max(np.mean(cb_mismatches), np.mean(cr_mismatches), np.mean(combined_mismatches)) > threshold:
         print(f"FAIL: bit mismatch exceeds {threshold:.0%} -- the LSB attack is not reliably "
-              "surviving the save/reload round trip, investigate before submitting")
+              "surviving the save/reload round trip")
     else:
         print("PASS: LSB bits reliably survive the PNG round trip")
 

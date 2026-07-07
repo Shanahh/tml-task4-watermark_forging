@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""Generic naive baseline attack.
-
-Averages the high-pass residual across a watermark group's 25 source images
-and additively transfers that mean residual onto the matching clean targets.
-
-This is the "simple averaging" idea from Yang et al. (NeurIPS 2024) applied
-in the forging direction: averaging over many images carrying the same
-watermark message cancels out image content and isolates the
-content-independent common signal, which can then be re-applied to new clean
-images.
-
-Acts as the fallback attack for any category with no validated category-
-specific signal, and as the required ablation baseline for categories that do
-have a specialized attack.
-"""
 from __future__ import annotations
 
 import argparse

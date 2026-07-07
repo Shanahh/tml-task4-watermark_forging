@@ -1,48 +1,3 @@
-#!/usr/bin/env python3
-"""Calibrate per-category attack strength by matching the genuine watermark's
-OWN amplitude, read directly off the 25 source images, instead of maximizing
-the perturbation within an LPIPS budget.
-
-Why this exists
----------------
-The score is Sdet * Sqlt. We can measure Sqlt locally (LPIPS), but we have no
-local measurement of Sdet (bit accuracy of the real, unseen decoder). Every
-strength choice so far has therefore been "how hard can we push within the
-quality budget" -- maximize subject to LPIPS. That is the wrong objective: for
-an additive, content-independent watermark the correct strength is the one
-that REPRODUCES the genuine watermark's amplitude, not the largest one quality
-allows. Overshooting puts the forgery outside the distribution of genuine
-watermarked images, which a normalizing / sign-based decoder can read *worse*,
-while also costing Sqlt -- a double loss.
-
-The model and the measurement
------------------------------
-For WM_1/3/4/5 the watermark is additive and content-independent: every source
-is clean_content + delta, the same delta. The extracted template t-hat points
-in the delta direction. Projecting a residual onto t-hat collapses an image to
-a single number = "how much watermark is present along its own axis":
-
-  - The 25 sources form a tight cluster: mean mu_s, std sigma_s. This IS the
-    genuine watermark amplitude and its natural spread.
-  - A clean target projects to ~0 (no watermark; only content leakage).
-  - A forgery clean + s*t projects linearly in s. The strength s* whose
-    forgery projection equals mu_s is the amplitude-calibrated strength: it
-    makes the forgery as watermarked as a genuine source, no more, no less.
-
-This tool reports, per category and channel, mu_s +/- sigma_s, the calibrated
-s*, and -- crucially -- where the currently-configured strength lands relative
-to the genuine cluster, in units of sigma_s. A current strength sitting many
-sigma above mu_s is overshooting (likely hurting Sdet); far below is
-under-driving.
-
-WM_6 is intentionally skipped: its DCT distribution-matching attack already
-calibrates to the source coefficient distribution by construction (it
-interpolates toward the WM_6 source stats and saturates at full match), so
-amplitude is not a free knob there.
-
-This is a read-only diagnostic -- it changes nothing, it only tells you which
-strength to pass to forge_specialized.py / run_pipeline.sh.
-"""
 from __future__ import annotations
 
 import argparse
@@ -71,15 +26,13 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", type=Path, required=True)
     p.add_argument("--output", type=Path, default=Path("strength_calibration.json"))
-    # The strengths currently in use, so the report can show where they land.
-    # Defaults mirror forge_specialized.py's defaults.
-    p.add_argument("--wm1-strength", type=float, default=0.0024)
-    p.add_argument("--wm3-y-strength", type=float, default=0.0079)
-    p.add_argument("--wm3-cb-strength", type=float, default=0.0017)
-    p.add_argument("--wm3-cr-strength", type=float, default=0.0017)
-    p.add_argument("--wm4-strength", type=float, default=0.0091)
-    p.add_argument("--wm5-strength", type=float, default=0.0071)
-    p.add_argument("--wm4-threshold", type=float, default=0.45)
+    p.add_argument("--wm1-strength", type=float, default=0.002)
+    p.add_argument("--wm3-y-strength", type=float, default=0.007)
+    p.add_argument("--wm3-cb-strength", type=float, default=0.001)
+    p.add_argument("--wm3-cr-strength", type=float, default=0.001)
+    p.add_argument("--wm4-strength", type=float, default=0.009)
+    p.add_argument("--wm5-strength", type=float, default=0.007)
+    p.add_argument("--wm4-threshold", type=float, default=0.4)
     p.add_argument(
         "--extraction",
         default="highpass",
@@ -91,13 +44,6 @@ def parse_args():
     return p.parse_args()
 
 
-# --------------------------------------------------------------------------
-# Residual operators -- must match how each template's sources are built in
-# forge_specialized.py, so the projection is in the right domain. channel_
-# residual is imported from forge_specialized so the two stay identical; only
-# luma_residual (for WM_4's phase template) is local.
-# --------------------------------------------------------------------------
-
 def luma_residual(x):
     g = grayscale(x)
     return g - gaussian_filter(g, 1.5, mode="reflect")
@@ -106,10 +52,6 @@ def luma_residual(x):
 def project(residual, t_hat):
     return float(np.sum(residual * t_hat))
 
-
-# --------------------------------------------------------------------------
-# Per (category, channel) attack specs: template + matching residual + apply
-# --------------------------------------------------------------------------
 
 def build_specs(src, current_strengths, wm4_threshold, method):
     specs = []
@@ -220,10 +162,6 @@ def main():
     write_json(args.output, results)
     print(f"\nwrote {args.output}")
 
-    # Emit a copy-pasteable forge_specialized.py flag string with the
-    # calibrated s* values. WM_3 takes per-channel flags; the other channel
-    # categories take one flag (WM_5's Cb/Cr are averaged since the attack
-    # uses one strength for both).
     by_cat_ch = {(r["category"], r["channel"]): r["calibrated_strength"] for r in results}
     flags = [f"--wm1-strength {by_cat_ch[('WM_1', 'Cb')]:.4f}"]
     flags.append(f"--wm3-y-strength {by_cat_ch[('WM_3', 'Y')]:.4f}")

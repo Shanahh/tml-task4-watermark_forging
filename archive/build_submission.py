@@ -1,10 +1,3 @@
-#!/usr/bin/env python3
-"""Assemble the final 200-image submission zip from per-category candidate
-directories, described by a routing JSON file mapping category -> directory.
-
-Any category omitted from the routing file (or whose candidate file is
-missing for a given id) falls back to the unmodified clean target.
-"""
 from __future__ import annotations
 
 import argparse

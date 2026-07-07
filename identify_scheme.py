@@ -1,56 +1,3 @@
-#!/usr/bin/env python3
-"""Test whether each of the 8 unidentified watermark groups is actually an
-instance of a well-known, OPEN-SOURCE watermarking scheme, rather than
-estimating the watermark statistically.
-
-Rationale: the task's reference papers (WMCopier, Watermark Copy Attack, etc.)
-all benchmark against a small set of standard schemes with public pip-
-installable encode/decode implementations: DwtDct, DwtDctSvd, RivaGAN (via
-`invisible-watermark`); a separate DWT+DCT+SVD blind scheme (via
-`blind-watermark`); and TrustMark, a modern deep encoder/decoder scheme (via
-`trustmark`) purpose-built for exactly this content-provenance use case. If a
-group's 25 sources actually came from one of these, running that scheme's OWN
-decoder on them should recover the SAME message bits consistently across all
-25 images -- not because we estimated anything, but because we're reading out
-the real embedding with the real algorithm. That is qualitatively different
-from (and far stronger than) any statistical delta estimate: if a match is
-found, the SAME library's encoder can then embed that exact message on the
-clean targets directly, for near-perfect bit accuracy at near-zero perceptual
-cost.
-
-Method: for each candidate scheme/parameter combination, decode all 25
-sources of a group and measure bit-AGREEMENT with the per-bit majority vote
-across those 25 decodes. Compare against the same measurement on 25 clean
-(unwatermarked) images of matching resolution as a negative control. A
-scheme/param combo is flagged as a plausible match only if source agreement
-is both high in absolute terms AND clearly above the clean-image control
-(ruling out a scheme that just happens to produce stable-looking output on
-any image, e.g. because of block-level DC energy rather than an actual
-embedded bit) AND the recovered majority bit string is roughly balanced
-(30-70% ones) -- a majority near all-0s/all-1s is a decode-bias artifact, not
-a real message. Confirmed empirically: WM_1 vs dwtDct(default params) looked
-like a hit (91% agreement) but its majority was ~95% ones and changed
-structure between bit-lengths -- a false positive this filter now catches.
-The genuine match found so far (WM_2 vs rivaGan, 32-bit message
-00010000101111110011101011101000, 98.9% agreement vs 62.6% control, balanced
-16/32 ones) round-trips perfectly through the real encoder.
-
-Classical scheme parameter sweep: dwtDct/dwtDctSvd's blind decode reads bits
-via modular arithmetic on a DCT/DWT coefficient (`coefficient % scale`), so
-the exact `scale` value used at encode time genuinely matters for correct
-decoding -- an untried scale is not the same test as an untried bit-length.
-Both methods also structurally only ever touch Y (channel index 0) and
-Cb/U (index 1) of YUV -- never Cr/V -- so the channel sweep only varies those
-two.
-
-This is a SCREENING tool, not a guarantee -- a match should be confirmed by
-round-tripping (encode the recovered message on clean targets with the same
-library, decode again, check bit accuracy and real LPIPS) before trusting it,
-and absence of a match does not rule out a scheme this script doesn't try
-(custom/proprietary schemes, or ones needing a secret key we don't have).
-
-Requires: pip install invisible-watermark blind-watermark onnxruntime trustmark
-"""
 from __future__ import annotations
 
 import argparse
@@ -69,11 +16,7 @@ def to_bgr_u8(rgb_float):
 def bit_agreement(bit_lists):
     """Mean fraction of bits matching the per-bit majority vote, across a
     list of equal-length 0/1 arrays, plus the majority string itself and its
-    balance (fraction of 1-bits). 1.0 agreement = perfect, ~0.5 = random.
-
-    A high agreement with a DEGENERATE majority (nearly all 0s or all 1s) is
-    a decode-bias artifact, not a real embedded message -- see module
-    docstring for the confirmed WM_1/dwtDct false positive this catches."""
+    balance (fraction of 1-bits). 1.0 agreement = perfect, ~0.5 = random."""
     if not bit_lists:
         return None, None, None
     M = np.stack(bit_lists).astype(np.int64)
@@ -90,12 +33,6 @@ def add_result(results, category, library, method, params, bit_lists_src, bit_li
         "majority": "".join(map(str, majority)) if majority is not None else None,
     })
 
-
-# --------------------------------------------------------------------------
-# invisible-watermark (imwatermark): dwtDct, dwtDctSvd, rivaGan -- default
-# parameters only. The scale/block/channel sweep for dwtDct/dwtDctSvd is
-# handled separately below (run_dct_scale_sweep).
-# --------------------------------------------------------------------------
 
 def imwatermark_decode_all(images_bgr, method, length, **configs):
     from imwatermark import WatermarkDecoder
@@ -134,7 +71,7 @@ def run_imwatermark(sources_bgr, control_bgr, results, category):
 
 
 # --------------------------------------------------------------------------
-# Classical scale/block/channel parameter sweep for dwtDct and dwtDctSvd.
+# scale/block/channel parameter sweep for dwtDct and dwtDctSvd.
 # --------------------------------------------------------------------------
 
 def run_dct_scale_sweep(sources_bgr, control_bgr, results, category, scale_grid, block_grid, length_grid):
@@ -192,13 +129,6 @@ def run_blind_watermark(sources_bgr, control_bgr, results, category):
         ctrl_bits = blind_watermark_decode_all(control_bgr, length)
         add_result(results, category, "blind_watermark", "dwt_dct_svd", f"len={length}", src_bits, ctrl_bits)
 
-
-# --------------------------------------------------------------------------
-# TrustMark: deep encoder/decoder, purpose-built for content provenance.
-# Works at any resolution (resizes internally) -- no 256x256 floor, so this
-# also covers WM_5 (128x128). use_ECC=False + MODE='binary' gives raw,
-# un-corrected 100-bit output, verified to round-trip at 100% locally.
-# --------------------------------------------------------------------------
 
 def trustmark_decode_all(images_bgr, tm):
     from PIL import Image
@@ -293,7 +223,7 @@ def main():
             verdict = "POSSIBLE MATCH"
             flagged.append(r)
         elif r["agreement"] > 0.9 and gap > 0.15 and degenerate:
-            verdict = "degenerate majority -- likely decode-bias artifact, not a real message"
+            verdict = "degenerate majority, likely decode-bias artifact"
         else:
             verdict = ""
         ctrl_str = f"{r['control']:.3f}" if r["control"] is not None else "n/a"
@@ -301,12 +231,11 @@ def main():
         print(f"{r['category']:6} {r['library']:14} {r['method']:10} {r['params']:30} "
               f"{r['agreement']:7.3f} {ctrl_str:>8} {bal_str:>8}  {verdict}")
 
-    print(f"\n{len(flagged)} possible match(es) flagged (balanced majority + high agreement + clear control gap).")
+    print(f"\n{len(flagged)} possible matches flagged.")
     for r in flagged:
         print(f"  {r['category']} / {r['library']} / {r['method']} ({r['params']}): majority bits = {r['majority']}")
     if flagged:
-        print("Confirm each by round-tripping: use the SAME library's encoder to embed this exact message")
-        print("on the matching clean targets, decode again, and check both bit accuracy and real LPIPS.")
+        print("Confirm by round-tripping")
 
 
 if __name__ == "__main__":

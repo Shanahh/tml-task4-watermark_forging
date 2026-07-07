@@ -1,46 +1,3 @@
-#!/usr/bin/env python3
-"""Sanity-check whether a surrogate-driven PGD attack is likely to transfer to
-the real, unseen watermark detector before spending a submission on it.
-
-The idea: craft PGD perturbations against one or more surrogate ensembles
-("attack"), then measure whether a *separate*, independently trained ensemble
-(different architecture, never used in the attack) also raises its
-"watermarked" probability on the same images. If your own surrogates don't
-agree, the perturbation is very unlikely to transfer to the real hidden
-detector either -- it is overfit to whatever the attack ensemble(s) happened
-to learn (which, per the validated diagnostics, may be image content/
-provenance rather than the watermark itself for categories like WM_2/7/8).
-
-Two pitfalls this script specifically guards against, found empirically:
-
-1. A naive "did forged_holdout_prob cross 0.5" flip-rate is misleading if the
-   holdout model is already miscalibrated and predicts >0.5 on many *clean*
-   images before any attack at all. holdout_flip_rate here only counts
-   genuine crossings (clean < 0.5, forged >= 0.5).
-2. A holdout model can collapse to a near-constant output regardless of input
-   (degenerate training on too little signal). Such a holdout can't judge
-   transfer either way -- this is flagged separately as "holdout
-   uninformative" rather than silently reported as "doesn't transfer".
-
-Typical usage:
-
-    python train_surrogate.py --dataset DATA --category WM_3 --arch cnn_a --output-dir surrogates
-    python train_surrogate.py --dataset DATA --category WM_3 --arch cnn_b --output-dir surrogates
-    python train_surrogate.py --dataset DATA --category WM_3 --arch cnn_c --output-dir surrogates
-
-    # Single-architecture attack, single holdout:
-    python check_surrogate_transfer.py --dataset DATA --category WM_3 \
-        --attack-models surrogates --attack-archs cnn_a \
-        --holdout-models surrogates --holdout-arch cnn_b \
-        --eps 0.0078431373
-
-    # Ensemble attack (cnn_a + cnn_b together), judged against the third,
-    # still-independent architecture:
-    python check_surrogate_transfer.py --dataset DATA --category WM_3 \
-        --attack-models surrogates --attack-archs cnn_a,cnn_b \
-        --holdout-models surrogates --holdout-arch cnn_c \
-        --eps 0.0078431373
-"""
 from __future__ import annotations
 
 import argparse
@@ -126,9 +83,6 @@ def main():
     holdout_lift = float(np.mean([r["forged_holdout_prob"] - r["clean_holdout_prob"] for r in rows]))
     transfer_ratio = float(holdout_lift / attack_lift) if attack_lift > 1e-6 else 0.0
 
-    # Genuine flip: the holdout model actually crossed the decision boundary
-    # because of the attack, not because it already called the clean image
-    # positive before any perturbation was applied.
     genuine_flip_rate = float(np.mean([
         r["clean_holdout_prob"] < 0.5 and r["forged_holdout_prob"] >= 0.5 for r in rows
     ]))

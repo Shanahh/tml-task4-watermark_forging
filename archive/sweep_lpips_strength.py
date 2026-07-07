@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""Find the real usable strength budget per specialized category by directly
-measuring LPIPS, instead of guessing a conservative value and eyeballing the
-output.
-
-The conservative strength grid this pipeline started with (0.0025-0.02) was
-never validated against where LPIPS actually starts climbing -- "doesn't
-look visually disturbed" at a given strength is a sign of unclaimed Sdet
-budget, not evidence the strength is well-calibrated. Since
-Sqlt = exp(-8*LPIPS), this prints/saves a table of strength -> mean LPIPS ->
-Sqlt per category so you can see exactly where the curve bends, instead of
-picking a strength blind.
-
-Requires the `lpips` package (pip install lpips) -- there is no MSE-proxy
-fallback here, since the entire point of this tool is the real metric.
-"""
 from __future__ import annotations
 
 import argparse
@@ -102,7 +86,7 @@ def main():
         import torch
     except ImportError as e:
         raise SystemExit(
-            "this tool requires torch and the lpips package (pip install lpips) -- "
+            "requires torch and the lpips package (pip install lpips) -- "
             "there is no proxy-metric fallback since the point is the real metric"
         ) from e
 
