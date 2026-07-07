@@ -17,3 +17,10 @@ submissions/
 surrogates/
 wm3_candidates/
 wm3_surrogates/
+
+# LaTeX build artifacts
+report/*.aux
+report/*.log
+report/*.out
+report/*.bbl
+report/*.blg
